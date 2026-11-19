@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f6f6fa">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Панель сторис</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Перейти к содержимому</a>
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-icon" aria-hidden="true"><span></span></span>
+      <span>Панель сторис</span>
+    </div>
+    <nav class="navigation" aria-label="Разделы">
+      <a href="#accounts" data-page="accounts" aria-current="page"><span class="nav-icon person-icon" aria-hidden="true"></span>Аккаунты</a>
+      <a href="#stories" data-page="stories"><span class="nav-icon story-icon" aria-hidden="true"></span>Масслукинг</a>
+    </nav>
+    <div class="sidebar-note"><span class="status-dot" aria-hidden="true"></span>Демонстрационный режим</div>
+  </aside>
+
+  <div class="layout">
+    <header class="topbar">
+      <div class="brand mobile-brand">
+        <span class="brand-icon" aria-hidden="true"><span></span></span>
+        <span>Панель сторис</span>
+      </div>
+      <span class="workspace-name">Рабочая панель</span>
+      <span class="demo"><span class="status-dot" aria-hidden="true"></span>Демо</span>
+    </header>
+
+    <main id="main" tabindex="-1">
+      <section id="accounts-page" aria-labelledby="accounts-title">
+        <header class="page-heading">
+          <div>
+            <h1 id="accounts-title">Аккаунты</h1>
+            <p class="subtitle">Профили Telegram для запуска задач</p>
+          </div>
+          <button class="button primary" id="add-account" type="button"><span aria-hidden="true">+</span> Добавить аккаунт</button>
+        </header>
+
+        <div class="account-summary">
+          <div class="summary-copy">
+            <span>Готовы к запуску</span>
+            <strong id="connected-count">0</strong>
+            <span id="account-total">Тестовые аккаунты</span>
+          </div>
+          <div class="summary-art" aria-hidden="true">
+            <div class="orbit orbit-outer"></div>
+            <div class="orbit orbit-middle"></div>
+            <div class="orbit orbit-inner"></div>
+            <span class="orbit-point orbit-point-first"></span>
+            <span class="orbit-point orbit-point-second"></span>
+            <span class="orbit-point orbit-point-third"></span>
+          </div>
+        </div>
+
+        <section class="profiles" aria-labelledby="profiles-title">
+          <div class="section-heading">
+            <h2 id="profiles-title">Профили</h2>
+            <span class="muted small" id="profiles-count"></span>
+          </div>
+          <div class="account-list" id="account-list"></div>
+        </section>
+      </section>
+
+      <section id="stories-page" aria-labelledby="stories-title" hidden>
+        <header class="page-heading">
+          <div>
+            <h1 id="stories-title">Масслукинг</h1>
+            <p class="subtitle">Импорт чатов, проверка сторис и просмотр на тестовых данных</p>
+          </div>
+        </header>
+
+        <div class="work-grid">
+          <section class="card import-card" aria-labelledby="import-title">
+            <h2 id="import-title">Импорт чатов</h2>
+            <div class="upload">
+              <span class="file-icon" aria-hidden="true"><span></span></span>
+              <strong>Файл со списком чатов</strong>
+              <p class="muted">TXT или CSV с @username или ссылками t.me</p>
+              <input id="chat-file" type="file" accept=".txt,.csv,text/plain,text/csv" hidden>
+              <div class="button-row">
+                <button class="button secondary" id="upload-chats" type="button">Выбрать файл</button>
+                <button class="button quiet" id="example-chats" type="button">Загрузить пример</button>
+              </div>
+            </div>
+            <div class="import-info" id="import-info" aria-live="polite"></div>
+          </section>
+
+          <section class="card setup-card" aria-labelledby="setup-title">
+            <h2 id="setup-title">Параметры проверки</h2>
+            <label class="field">
+              <span>Аккаунт</span>
+              <select id="run-account"></select>
+            </label>
+            <label class="field">
+              <span>Лимит профилей</span>
+              <select id="run-limit">
+                <option value="10">10 профилей</option>
+                <option value="20">20 профилей</option>
+                <option value="40">40 профилей</option>
+              </select>
+            </label>
+            <p class="muted small" id="check-hint"></p>
+            <button class="button primary" id="check-stories" type="button" disabled>Проверить сторис</button>
+          </section>
+        </div>
+
+        <section class="card results-card" aria-labelledby="results-title">
+          <div class="section-heading">
+            <div>
+              <h2 id="results-title">Результаты</h2>
+              <p class="muted small" id="results-summary" aria-live="polite"></p>
+            </div>
+            <div class="button-row">
+              <button class="button primary" id="start-views" type="button" hidden>Запустить демо-просмотр</button>
+              <button class="button secondary" id="stop-views" type="button" hidden>Остановить</button>
+            </div>
+          </div>
+          <div id="run-progress" hidden>
+            <label class="small muted" id="progress-label" for="views-progress"></label>
+            <progress id="views-progress" value="0" max="1"></progress>
+          </div>
+          <div id="results-list"></div>
+        </section>
+
+        <section class="card history-card" aria-labelledby="history-title">
+          <div class="section-heading"><h2 id="history-title">Журнал задач</h2></div>
+          <div id="event-list"></div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <dialog class="modal" id="profile-dialog" aria-labelledby="dialog-title">
+    <form id="profile-form">
+      <div class="section-heading">
+        <h2 id="dialog-title">Изменить профиль</h2>
+        <button class="close-button" type="button" id="close-dialog" aria-label="Закрыть">×</button>
+      </div>
+      <p class="muted small" id="demo-sign-in" hidden>В рабочей версии вход подтверждается в Telegram. Здесь можно создать тестовый профиль.</p>
+      <div class="avatar-editor">
+        <div id="avatar-preview"></div>
+        <div class="avatar-actions">
+          <label class="button secondary" for="avatar-file">Загрузить фото</label>
+          <input id="avatar-file" class="visually-hidden" type="file" accept="image/jpeg,image/png,image/webp">
+          <button class="button quiet" id="remove-avatar" type="button" hidden>Убрать фото</button>
+        </div>
+      </div>
+      <div class="name-fields">
+        <label class="field"><span>Имя</span><input id="first-name" autocomplete="off" maxlength="64" required autofocus></label>
+        <label class="field"><span>Фамилия</span><input id="last-name" autocomplete="off" maxlength="64"></label>
+      </div>
+      <label class="field"><span>Юзернейм</span><input id="username" autocapitalize="none" autocomplete="off" spellcheck="false" maxlength="33" placeholder="@username" required></label>
+      <p class="form-error small" id="profile-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="button secondary" id="cancel-profile" type="button">Отмена</button>
+        <button class="button primary" id="save-profile" type="submit">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
+  <div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>

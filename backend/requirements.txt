@@ -1,0 +1,6 @@
+cryptography>=44,<49
+fastapi>=0.115,<1
+httpx>=0.28,<1
+python-socks[asyncio]>=2.7,<3
+telethon>=1.42,<2
+uvicorn>=0.34,<1
