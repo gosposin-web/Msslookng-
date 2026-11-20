@@ -20,9 +20,11 @@ from pydantic import BaseModel, Field
 from .archive import ArchiveError, MAX_UPLOAD, extract_tdata
 from .config import Config
 from .db import DB, now
-from .telegram import TelegramError, TelegramGateway, friendly_error, normalize_chat, api_credentials
+from .telegram import TelegramError, TelegramGateway, normalize_chat, api_credentials
 from .worker import VIEW_LIMIT_24H, Worker
 from .snapshot import SnapshotStore, SnapshotError
+from .account_access import AccountAccessError, account_error
+from .avatar import MAX_PHOTO_UPLOAD, prepare_avatar
 
 STATIC = Path(__file__).parent / 'static'
 COOKIE = 'story_cloud_session'
@@ -35,7 +37,8 @@ class BodyLimitMiddleware:
     async def __call__(self, scope, receive, send):
         if scope['type']!='http':
             return await self.app(scope,receive,send)
-        limit = MAX_UPLOAD+128*1024 if scope['path']=='/api/account/tdata' else 128*1024
+        limit = (MAX_UPLOAD+128*1024 if scope['path']=='/api/account/tdata' else
+                 MAX_PHOTO_UPLOAD+64*1024 if scope['path']=='/api/account/profile/photo' else 128*1024)
         headers=dict(scope.get('headers',[]))
         try:
             content_length=int(headers.get(b'content-length',b'0'))
@@ -85,6 +88,15 @@ class ViewInput(BaseModel):
 
 class ControlInput(BaseModel):
     action: str
+
+
+class NameInput(BaseModel):
+    first_name: str = Field(max_length=64)
+    last_name: str = Field(default='',max_length=64)
+
+
+class UsernameInput(BaseModel):
+    username: str = Field(default='',max_length=33)
 
 
 def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
@@ -138,11 +150,11 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                 await storage.flush()
             except SnapshotError as exc:
                 return JSONResponse({'detail':str(exc)},status_code=503)
-        response.headers['Cache-Control']='no-store'
+        response.headers.setdefault('Cache-Control','no-store')
         response.headers['X-Content-Type-Options']='nosniff'
         response.headers['Referrer-Policy']='no-referrer'
         response.headers['X-Frame-Options']='DENY'
-        response.headers['Content-Security-Policy']="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'; connect-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+        response.headers['Content-Security-Policy']="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; script-src 'self'; connect-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
         if config.cookie_secure:
             response.headers['Strict-Transport-Security']='max-age=31536000'
         return response
@@ -214,7 +226,6 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
 
     @app.get('/api/state')
     def state(login=Depends(authenticated)):
-        account=db.account()
         people=db.all('SELECT stories FROM people')
         active=sum(any(s['expires']>now() for s in json.loads(p['stories'])) for p in people)
         sources=db.all('''SELECT s.*,(SELECT COUNT(*) FROM source_people sp WHERE sp.source_id=s.id) AS collected
@@ -225,7 +236,7 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
             jobs.append(db.public_job(row)|{'total':len(p.get('user_ids',[])) if row['kind']=='view' else row['collected'],
                                            'phase':p.get('phase','gather')})
         cooldown=db.one("SELECT value FROM runtime WHERE key='telegram_wait_until'")
-        return {'account':{k:account[k] for k in ('user_id','name','username','created_at')} if account else None,
+        return {'account':db.public_account(),
                 'sources':sources,'jobs':jobs,'events':db.all('SELECT * FROM events ORDER BY id DESC LIMIT 50'),
                 'stats':{'people':len(people),'active':active,'views_24h':db.one('SELECT COUNT(*) n FROM views WHERE viewed_at>?',(now()-86400,))['n']},
                 'view_limit_24h':VIEW_LIMIT_24H,'cooldown_until':cooldown['value'] if cooldown else 0,
@@ -250,6 +261,9 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
             raise HTTPException(400,'Слишком длинный пароль.')
         try:
             async with gateway.lock:
+                check_telegram_cooldown()
+                if storage:
+                    await storage.flush()
                 with tempfile.TemporaryDirectory(prefix='story-tdata-') as temp:
                     root=Path(temp)
                     archive=root/'account.zip'
@@ -269,12 +283,88 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
         except HTTPException:
             raise
         except ArchiveError as exc:
-            raise HTTPException(400,str(exc)) from None
+            return error_response(AccountAccessError('TDATA_ARCHIVE_INVALID',str(exc),
+                                  'Загрузите ZIP с файлами авторизации вашего Telegram Desktop.'))
+        except SnapshotError as exc:
+            raise HTTPException(503,str(exc)) from None
         except Exception as exc:
-            raise HTTPException(400,friendly_error(exc)) from None
+            return error_response(exc)
         finally:
             await file.close()
         return {'ok':True}
+
+    def check_telegram_cooldown():
+        wait = db.one("SELECT value FROM runtime WHERE key='telegram_wait_until'")
+        if wait and wait['value'] > now():
+            raise AccountAccessError('RATE_LIMIT','Telegram попросил подождать.',
+                                     'Повторите после завершения паузы Telegram.',retry_after=wait['value']-now())
+
+    def error_response(exc):
+        error = account_error(exc)
+        if error.retry_after:
+            db.execute("INSERT INTO runtime(key,value) VALUES('telegram_wait_until',?) ON CONFLICT(key) DO UPDATE SET value=MAX(value,excluded.value)",
+                       (now()+error.retry_after,))
+        return JSONResponse(error.payload(),status_code=429 if error.retry_after else 400,
+                            headers={'Retry-After':str(error.retry_after)} if error.retry_after else {})
+
+    async def profile_action(operation, *, mutation=False):
+        need_account()
+        if gateway.lock.locked():
+            raise HTTPException(409,'Аккаунт занят другим действием. Дождитесь его окончания или приостановите задание.')
+        try:
+            async with gateway.lock:
+                check_telegram_cooldown()
+                if storage:
+                    await storage.flush()
+                async with asyncio.timeout(45):
+                    profile = await operation()
+                if mutation:
+                    db.event('Профиль обновлён в Telegram.')
+                # Profile reads update the durable cache too.
+                if storage:
+                    await storage.flush()
+                return {'ok':True,'account':profile}
+        except HTTPException:
+            raise
+        except SnapshotError as exc:
+            raise HTTPException(503,str(exc)) from None
+        except Exception as exc:
+            return error_response(exc)
+
+    @app.get('/api/account/profile')
+    async def profile(login=Depends(authenticated)):
+        return await profile_action(gateway.read_profile)
+
+    @app.post('/api/account/profile/name')
+    async def profile_name(body: NameInput,login=Depends(authenticated)):
+        return await profile_action(lambda:gateway.change_name(body.first_name,body.last_name),mutation=True)
+
+    @app.post('/api/account/profile/username')
+    async def profile_username(body: UsernameInput,login=Depends(authenticated)):
+        return await profile_action(lambda:gateway.change_username(body.username),mutation=True)
+
+    @app.post('/api/account/profile/photo')
+    async def profile_photo(file: UploadFile=File(...),login=Depends(authenticated)):
+        need_account()
+        try:
+            data = await file.read(MAX_PHOTO_UPLOAD+1)
+            photo,thumbnail = await asyncio.to_thread(prepare_avatar,data)
+        except Exception as exc:
+            return error_response(exc)
+        finally:
+            await file.close()
+        return await profile_action(lambda:gateway.change_avatar(photo,thumbnail),mutation=True)
+
+    @app.get('/api/account/profile/photo')
+    def get_profile_photo(request: Request,login=Depends(authenticated)):
+        row = db.one('SELECT photo,photo_revision FROM account_profile WHERE id=1')
+        if not row or not row['photo']:
+            raise HTTPException(404,'Аватарка не загружена.')
+        etag = '"'+row['photo_revision']+'"'
+        cache = {'ETag':etag,'Cache-Control':'private, max-age=300','Vary':'Cookie, X-Story-User'}
+        if request.headers.get('if-none-match') == etag:
+            return Response(status_code=304,headers=cache)
+        return Response(row['photo'],media_type='image/jpeg',headers=cache)
 
     @app.delete('/api/account')
     async def disconnect(login=Depends(authenticated)):

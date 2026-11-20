@@ -36,6 +36,7 @@ let server=false,authenticated=false,csrf='',page='overview',people=[],totalPeop
 const app=document.querySelector('#app');
 const dialog=document.querySelector('#dialog');
 let toastTimer;
+let profileLoading=false,profileBusy=false,avatarPreview='';
 
 function toast(message){const el=document.querySelector('#toast');el.textContent=message;el.classList.add('visible');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('visible'),6500);}
 function online(){if(server&&authenticated)return true;toast(server?'Войдите в панель.':'Сервер Telegram ещё не запущен. Сейчас доступен просмотр интерфейса.');return false;}
@@ -45,7 +46,7 @@ async function api(path,options={}){
  if(options.body&&!(options.body instanceof FormData)){headers['Content-Type']='application/json';options.body=JSON.stringify(options.body);}
  const response=await fetch(path,{...options,headers,credentials:'same-origin'});
  let data;try{data=await response.json();}catch{throw new Error('Сервер не ответил. Повторите позже.');}
- if(!response.ok){if(response.status===401&&server&&path!=='/api/auth/login'){authenticated=false;showLogin();}const error=new Error(Array.isArray(data.detail)?'Проверьте значения полей.':data.detail||'Не удалось выполнить действие.');error.status=response.status;throw error;}
+ if(!response.ok){if(response.status===401&&server&&path!=='/api/auth/login'){authenticated=false;showLogin();}const error=new Error(Array.isArray(data.detail)?'Проверьте значения полей.':data.detail||'Не удалось выполнить действие.');Object.assign(error,{status:response.status,code:data.code,hint:data.hint,appealUrl:data.appeal_url,freezeUntil:data.freeze_until});throw error;}
  return data;
 }
 function nav(mobile=false){return Object.entries(labels).map(([key,label])=>`<button type='button' class='${mobile?'':'nav-btn '}${page===key?'active':''}' data-tab='${key}' ${page===key?"aria-current='page'":''}>${icon(navIcons[key])}<span>${label}</span>${!mobile&&key==='audience'&&state.stats.people?`<span class='nav-count'>${number(state.stats.people)}</span>`:''}</button>`).join('');}
@@ -77,9 +78,44 @@ function jobCard(j){
 }
 function eventsView(max=20){return state.events.length?state.events.slice(0,max).map(e=>`<div class='event'><i class='event-mark ${esc(e.level)}'></i><div><p>${esc(e.message)}</p><time>${esc(date(e.created_at))}</time></div></div>`).join(''):empty('clock','Ничего не пропущено','Подключения, результаты и паузы Telegram будут записаны здесь.');}
 function jobsPage(){return title('ФОНОВАЯ РАБОТА','Задания',state.free_mode?'Сервер работает до перехода в сон. После пробуждения задания восстановятся из сохранения.':'После запуска можно закрыть страницу — сервер продолжит работу.',button('refresh','Обновить','light','','refresh'))+`<div class='bottom-grid'><section>${state.jobs.length?state.jobs.map(jobCard).join(''):`<div class='card'>${empty('jobs','Очередь пуста','Начните со сбора аудитории из одного чата.',button('go-sources','Выбрать чат','light','','chat'))}</div>`}</section><section class='card'><div class='section-top'><h2>Журнал</h2><small>Последние события</small></div>${eventsView()}</section></div>`;}
+function profileAvatar(){return state.account?.has_avatar?`<img src='/api/account/profile/photo?v=${esc(state.account.photo_revision)}' alt='Текущая аватарка'>`:esc(initials(state.account?.name));}
+function profileForms(){
+ const a=state.account,disabled=profileLoading||profileBusy||!a.profile_loaded;
+ return `<div class='profile-forms'>
+ <form id='profile-name-form' class='profile-form'><fieldset ${disabled?'disabled':''}><h3>Имя и фамилия</h3><div class='field-row'><label class='field'><span>Имя</span><input name='first_name' value='${esc(a.first_name)}' maxlength='64' required autocomplete='given-name'></label><label class='field'><span>Фамилия</span><input name='last_name' value='${esc(a.last_name)}' maxlength='64' autocomplete='family-name'><small>Можно оставить пустой.</small></label></div><div id='profile-name-error' class='inline-error' role='alert'></div><button type='submit' class='btn primary'>Сохранить имя</button><span class='profile-saved' role='status'></span></fieldset></form>
+ <form id='profile-username-form' class='profile-form'><fieldset ${disabled?'disabled':''}><h3>Username</h3><label class='field'><span>Имя пользователя</span><input name='username' value='${esc(a.username)}' maxlength='33' placeholder='@username' autocapitalize='off' autocomplete='off' spellcheck='false'><small>5–32 латинские буквы, цифры или _. Пустое поле удалит username.</small></label><div id='profile-username-error' class='inline-error' role='alert'></div><button type='submit' class='btn primary'>Сохранить username</button><span class='profile-saved' role='status'></span></fieldset></form>
+ <form id='profile-photo-form' class='profile-form'><fieldset ${disabled?'disabled':''}><h3>Аватарка</h3><div class='avatar-upload'><span id='avatar-preview' class='avatar'>${profileAvatar()}</span><label class='field'><span>Выберите фото из галереи</span><input name='file' type='file' accept='image/jpeg,image/png,image/webp' required><small>JPG, PNG или WebP до 5 МБ, от 160 × 160 пикселей. Сохраняется квадрат по центру фотографии.</small></label></div><div id='profile-photo-error' class='inline-error' role='alert'></div><button type='submit' class='btn primary'>Сохранить аватарку</button><span class='profile-saved' role='status'></span></fieldset></form></div>`;
+}
+function showError(el,err){
+ if(!el)return;
+ el.replaceChildren();
+ const message=document.createElement('strong');message.textContent=err.message;el.append(message);
+ if(err.hint){const hint=document.createElement('p');hint.textContent=err.hint;el.append(hint);}
+ if(err.freezeUntil){const deadline=document.createElement('p');deadline.textContent='Telegram указал срок до возможного удаления аккаунта: '+new Intl.DateTimeFormat('ru-RU',{dateStyle:'medium',timeStyle:'short',timeZone:'Europe/Moscow'}).format(new Date(err.freezeUntil*1000))+' (МСК). Это не дата разморозки.';el.append(deadline);}
+ if(err.appealUrl){try{const url=new URL(err.appealUrl);if(url.protocol==='https:'&&['telegram.org','www.telegram.org','t.me'].includes(url.hostname)){const link=document.createElement('a');link.href=url.href;link.textContent='Открыть апелляцию Telegram';link.target='_blank';link.rel='noopener noreferrer';el.append(link);}}catch{}}
+ if(err.code){const code=document.createElement('small');code.textContent='Код: '+err.code;el.append(code);}
+}
+function updateProfileHeader(){
+ const a=state.account;if(!a)return;
+ const name=document.getElementById('profile-current-name'),username=document.getElementById('profile-current-username');
+ if(name)name.textContent=a.name;if(username)username.textContent=a.username?'@'+a.username:'ID '+a.user_id;
+ document.querySelectorAll('[data-profile-avatar]').forEach(el=>el.innerHTML=profileAvatar());
+ const mini=document.querySelector('.account-mini strong');if(mini)mini.textContent=a.name;
+ const miniAvatar=document.querySelector('.account-mini .avatar');if(miniAvatar)miniAvatar.innerHTML=profileAvatar();
+}
+function lockProfileForms(value){document.querySelectorAll('.profile-form fieldset').forEach(el=>el.disabled=value);const refresh=document.querySelector('[data-action="refresh-profile"]');if(refresh)refresh.disabled=value;}
+async function refreshProfile(){
+ if(!state.account||profileBusy||profileLoading)return;
+ profileLoading=true;lockProfileForms(true);
+ const loading=document.getElementById('profile-loading');if(loading)loading.textContent='Проверяем профиль…';
+ const error=document.getElementById('profile-error');if(error)error.textContent='';
+ try{const d=await api('/api/account/profile');state.account=d.account;if(page==='account'){render();}}
+ catch(err){if(page==='account')showError(document.getElementById('profile-error'),err);else toast(err.message);}
+ finally{profileLoading=false;if(page==='account'){lockProfileForms(!state.account?.profile_loaded);const label=document.getElementById('profile-loading');if(label)label.textContent='';}}
+}
 function accountPage(){
  let body;
- if(state.account){body=`<h2>Аккаунт подключён</h2><p class='form-intro'>Облачная сессия готова к работе.</p><div class='connected-account'><span class='avatar'>${esc(initials(state.account.name))}</span><div><h3>${esc(state.account.name)}</h3><p>${state.account.username?'@'+esc(state.account.username):'ID '+esc(state.account.user_id)}</p></div></div><div class='notice'>${icon('lock')}<span>Создана отдельная сессия Story Cloud. Её можно завершить здесь или в разделе «Устройства» в Telegram.</span></div><p class='form-intro'>Подключён ${esc(date(state.account.created_at))}. Архив tdata после импорта удалён.</p>${button('confirm-disconnect','Отключить аккаунт','danger','','logout')}`;}
+ if(state.account){body=`<h2>Профиль Telegram</h2><p class='form-intro'>Изменения сохраняются в вашем аккаунте Telegram.</p><div class='connected-account'><span class='avatar' data-profile-avatar>${profileAvatar()}</span><div><h3 id='profile-current-name'>${esc(state.account.name)}</h3><p id='profile-current-username'>${state.account.username?'@'+esc(state.account.username):'ID '+esc(state.account.user_id)}</p></div></div><div class='profile-toolbar'>${button('refresh-profile','Обновить из Telegram','light','','refresh')}<span id='profile-loading' role='status'>${profileLoading?'Проверяем профиль…':''}</span></div><div id='profile-error' class='inline-error' role='alert'></div>${profileForms()}<div class='notice'>${icon('lock')}<span>Создана отдельная сессия Story Cloud. Её можно завершить здесь или в разделе «Устройства» в Telegram.</span></div><p class='form-intro'>Подключён ${esc(date(state.account.created_at))}. Архив tdata после импорта удалён.</p>${button('confirm-disconnect','Отключить аккаунт','danger','','logout')}`;}
  else body=`<h2>Подключение через tdata</h2><p class='form-intro'>Загрузите ZIP с папкой tdata. Из архива будет выбран активный аккаунт Telegram Desktop.</p>${!server?`<div class='notice warning'>${icon('cloud')}<span>Импорт откроется после запуска сервера. В предпросмотре файлы не загружаются и данные аккаунта не запрашиваются.</span></div>`:''}<form id='tdata-form'><fieldset ${!server?'disabled':''}><label class='field'><span>Архив tdata</span><input name='file' type='file' accept='.zip,application/zip' required><small>ZIP до 20 МБ. Файлы авторизации без кэша и медиа.</small></label>${!state.telegram_api_configured?`<div class='field-row'><label class='field'><span>API ID</span><input name='api_id' type='text' inputmode='numeric' pattern='[0-9]+' placeholder='12345678' required autocomplete='off'></label><label class='field'><span>API Hash</span><input name='api_hash' type='password' placeholder='32 символа' minlength='32' maxlength='32' required autocomplete='off'></label></div><p class='links-inline'>Параметры своего приложения: <a href='https://my.telegram.org/apps' target='_blank' rel='noopener noreferrer'>my.telegram.org</a>. Их достаточно ввести при подключении.</p>`:''}${state.telegram_api_mode==='public'?`<div class='notice'>${icon('info')}<span>Для пробного входа подключены опубликованные параметры Telegram Desktop. Можно загрузить tdata без заполнения API ID и API Hash.</span></div>`:''}${state.telegram_api_configured?`<details><summary>Свои API ID и API Hash — необязательно</summary><div class='field-row'><label class='field'><span>API ID</span><input name='api_id' type='text' inputmode='numeric' pattern='[0-9]+' placeholder='Оставить по умолчанию' autocomplete='off'></label><label class='field'><span>API Hash</span><input name='api_hash' type='password' placeholder='Оставить по умолчанию' minlength='32' maxlength='32' autocomplete='off'></label></div><p class='links-inline'>Если Telegram отклонит публичные параметры, укажите оба своих параметра с <a href='https://my.telegram.org/apps' target='_blank' rel='noopener noreferrer'>my.telegram.org</a>.</p></details>`:''}<details><summary>Пароли, если они установлены</summary><label class='field'><span>Код-пароль Telegram Desktop</span><input name='passcode' type='password' autocomplete='off' maxlength='512' placeholder='Если tdata зашифрована'><small>Локальный код-пароль исходного Telegram Desktop.</small></label><label class='field'><span>Пароль двухэтапной проверки</span><input name='password' type='password' autocomplete='off' maxlength='512' placeholder='Если включена в Telegram'><small>Нужен Telegram для создания отдельной облачной сессии.</small></label></details><div id='import-error' class='inline-error' role='alert'></div><div class='form-bottom'><small>Пароли и исходный архив не сохраняются после импорта.</small><button type='submit' class='btn primary'>${icon('lock')}Подключить аккаунт</button></div></fieldset></form>`;
  return title('ЛИЧНОЕ ПОДКЛЮЧЕНИЕ','Аккаунт','Один аккаунт. Отдельная облачная сессия.')+`<div class='account-grid'><section class='card'>${body}</section><aside class='card'><h2>Перед подключением</h2><div class='help-item'><h3>tdata — формат Desktop</h3><p>Нужен уже имеющийся архив вашего Telegram Desktop. Сам мобильный Telegram такой архив не создаёт.</p></div><div class='help-item'><h3>Доступ к аккаунту</h3><p>tdata содержит ключи входа. Загружайте только свой архив в свою панель. Подключение доступно после входа по паролю панели.</p></div><div class='help-item'><h3>Постоянное хранение</h3><p>Сессия хранится на сервере в зашифрованном виде. При отключении данные сессии и собранная аудитория удаляются из приложения.</p></div><div class='help-item'><h3>Ограничения Telegram</h3><p>Запросы ожидания соблюдаются автоматически. Внутренние лимиты приложения не гарантируют отсутствие ограничений аккаунта.</p></div></aside></div>${server?`<div class='footer-logout'>${state.auth_mode==='chatgpt'?`<a class='btn light' href='/signout-with-chatgpt?return_to=%2F' target='_top'>${icon('logout')}Выйти из панели</a>`:button('logout','Выйти из панели','light','','logout')}</div>`:''}`;
 }
@@ -90,7 +126,7 @@ function addSource(){showDialog(dialogTitle('Добавить чат')+`<p>Ук�
 function viewDialog(){if(!selected.size)return;showDialog(dialogTitle('Смотреть выбранные истории')+`<p>Выбрано пользователей: <strong>${number(selected.size)}</strong>. Перед просмотром доступность историй будет проверена повторно. Уже просмотренные истории пропускаются.</p><form id='view-form'><label class='field'><span>Интервал между пользователями, сек.</span><input name='delay' type='number' inputmode='numeric' min='5' max='300' value='15' required><small>Внутренний предел приложения — ${state.view_limit_24h} историй за 24 часа. Запросы ожидания Telegram имеют приоритет.</small></label><div class='inline-error' id='view-error' role='alert'></div><div class='dialog-actions'>${button('close-dialog','Отмена','light')}<button class='btn primary' type='submit'>${icon('play')}Запустить</button></div></form>`);}
 async function sync(renderAfter=true){if(!server||!authenticated)return;state=await api('/api/state');if(page==='audience')await loadPeople();else if(renderAfter)render();}
 async function loadPeople(){if(!server||!authenticated){people=[];totalPeople=0;renderPeople();return;}const q=new URLSearchParams({search,source,active:String(activeOnly),offset:String(offset)});const d=await api('/api/people?'+q);people=d.people;totalPeople=d.total;renderPeople();}
-async function go(next){page=next;if(next==='audience'){render();await loadPeople();}else render();window.scrollTo({top:0,behavior:'instant'});}
+async function go(next){if(avatarPreview){URL.revokeObjectURL(avatarPreview);avatarPreview='';}page=next;if(next==='audience'){render();await loadPeople();}else render();window.scrollTo({top:0,behavior:'instant'});if(next==='account'&&state.account)await refreshProfile();}
 dialog.addEventListener('cancel',e=>{if(dialog.dataset.login==='true')e.preventDefault();});
 document.addEventListener('click',async e=>{
  const target=e.target.closest('[data-action],[data-tab]');if(!target)return;
@@ -114,6 +150,7 @@ document.addEventListener('click',async e=>{
   if(action==='delete-source-confirm'){await api(`/api/sources/${id}`,{method:'DELETE'});dialog.close();await sync();toast('Чат удалён.');}
   if(action.startsWith('job-')){await api(`/api/jobs/${id}/control`,{method:'POST',body:{action:action.slice(4)}});await sync();}
   if(action==='refresh'){await sync();toast('Данные обновлены.');}
+  if(action==='refresh-profile'){await refreshProfile();}
   if(action==='prev-page'||action==='next-page'){offset=Math.max(0,offset+(action==='next-page'?100:-100));selected.clear();await loadPeople();}
   if(action==='export'){const q=new URLSearchParams({search,source,active:String(activeOnly)});const r=await fetch('/api/people/export?'+q,{credentials:'same-origin'});if(!r.ok)throw new Error('Не удалось скачать аудиторию. Обновите страницу.');const url=URL.createObjectURL(await r.blob());const link=document.createElement('a');link.href=url;link.download='story-audience.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}
   if(action==='confirm-disconnect'){showDialog(dialogTitle('Отключить аккаунт?')+`<p>Все его задания будут остановлены. Подключение, сессия и собранная аудитория будут удалены из приложения.</p><div class='dialog-actions'>${button('close-dialog','Отмена','light')}${button('disconnect','Отключить','danger')}</div>`);}
@@ -123,12 +160,30 @@ document.addEventListener('click',async e=>{
 });
 document.addEventListener('change',async e=>{
  try{
+ if(e.target.matches('#profile-photo-form input[type=file]')){const file=e.target.files[0];const error=document.getElementById('profile-photo-error');error.textContent='';if(avatarPreview){URL.revokeObjectURL(avatarPreview);avatarPreview='';}const preview=document.getElementById('avatar-preview');preview.innerHTML=profileAvatar();if(file){if(file.size>5*1024*1024){e.target.value='';throw new Error('Выберите фото размером до 5 МБ.');}avatarPreview=URL.createObjectURL(file);const image=document.createElement('img');image.src=avatarPreview;image.alt='Предпросмотр новой аватарки';preview.replaceChildren(image);}}
  if(e.target.dataset.person){e.target.checked?selected.add(e.target.dataset.person):selected.delete(e.target.dataset.person);renderSelection();}
  if(e.target.id==='select-page'){for(const p of people.filter(p=>p.stories_count)){e.target.checked?selected.add(p.user_id):selected.delete(p.user_id);}renderPeople();}
  if(e.target.id==='source-filter'){source=e.target.value;offset=0;selected.clear();await loadPeople();}
  }catch(err){toast(err.message);}
 });
-document.addEventListener('input',e=>{if(e.target.id==='people-search'){search=e.target.value;offset=0;clearTimeout(searchTimer);searchTimer=setTimeout(()=>loadPeople().catch(err=>toast(err.message)),300);}});
+document.addEventListener('input',e=>{if(e.target.id==='people-search'){search=e.target.value;offset=0;clearTimeout(searchTimer);searchTimer=setTimeout(()=>loadPeople().catch(err=>toast(err.message)),300);}if(e.target.closest('.profile-form')){const saved=e.target.closest('form').querySelector('.profile-saved');if(saved)saved.textContent='';}});
+document.addEventListener('submit',async e=>{
+ const form=e.target;if(!form.matches('.profile-form'))return;e.preventDefault();
+ if(!online()||profileBusy||profileLoading)return;
+ const data=new FormData(form),kind=form.id.split('-')[1],submit=form.querySelector('[type=submit]'),original=submit.textContent,error=document.getElementById(`profile-${kind}-error`);
+ error.textContent='';form.querySelector('.profile-saved').textContent='';
+ profileBusy=true;lockProfileForms(true);submit.textContent='Сохраняем в Telegram…';
+ try{
+  let body,path;
+  if(kind==='name'){body={first_name:data.get('first_name'),last_name:data.get('last_name')};path='name';}
+  if(kind==='username'){body={username:data.get('username')};path='username';}
+  if(kind==='photo'){const file=data.get('file');if(!file||!file.size||file.size>5*1024*1024)throw new Error('Выберите фото размером до 5 МБ.');body=data;path='photo';}
+  const result=await api('/api/account/profile/'+path,{method:'POST',body});state.account=result.account;
+  if(form.isConnected){updateProfileHeader();if(kind==='name'){form.elements.first_name.value=state.account.first_name;form.elements.last_name.value=state.account.last_name;}if(kind==='username')form.elements.username.value=state.account.username||'';if(kind==='photo'){form.reset();if(avatarPreview){URL.revokeObjectURL(avatarPreview);avatarPreview='';}document.getElementById('avatar-preview').innerHTML=profileAvatar();}form.querySelector('.profile-saved').textContent='Сохранено в Telegram';}
+  toast('Профиль обновлён в Telegram.');
+ }catch(err){if(error.isConnected)showError(error,err);else toast(err.message);}
+ finally{profileBusy=false;if(page==='account')lockProfileForms(!state.account?.profile_loaded);if(submit.isConnected)submit.textContent=original;}
+});
 document.addEventListener('submit',async e=>{
  const form=e.target;if(!['login-form','source-form','tdata-form','view-form'].includes(form.id))return;e.preventDefault();
  if(form.id!=='login-form'&&!online())return;
@@ -139,9 +194,9 @@ document.addEventListener('submit',async e=>{
   const data=new FormData(form);
   if(form.id==='login-form'){const d=await api('/api/auth/login',{method:'POST',body:{password:data.get('password')}});csrf=d.csrf;authenticated=true;form.reset();dialog.dataset.login='false';dialog.close();await sync();}
   if(form.id==='source-form'){await api('/api/sources',{method:'POST',body:{ref:data.get('ref'),mode:data.get('mode'),max_users:Number(data.get('max_users'))}});dialog.close();page='sources';await sync();toast('Чат добавлен. Теперь можно запустить сбор.');}
-  if(form.id==='tdata-form'){const file=data.get('file');if(!file||file.size>20*1024*1024)throw new Error('Выберите ZIP размером до 20 МБ.');submit.textContent='Подключаем… до 90 сек.';await api('/api/account/tdata',{method:'POST',body:data});form.reset();await sync();toast('Аккаунт подключён. Добавьте первый чат.');}
+  if(form.id==='tdata-form'){const file=data.get('file');if(!file||file.size>20*1024*1024)throw new Error('Выберите ZIP размером до 20 МБ.');submit.textContent='Подключаем… до 90 сек.';await api('/api/account/tdata',{method:'POST',body:data});form.reset();await sync();await refreshProfile();toast('Аккаунт подключён. Добавьте первый чат.');}
   if(form.id==='view-form'){await api('/api/jobs/view',{method:'POST',body:{user_ids:[...selected],delay:Number(data.get('delay'))}});selected.clear();dialog.close();page='jobs';await sync();toast('Просмотр поставлен в очередь.');}
- }catch(err){if(errEl&&errEl.isConnected)errEl.textContent=err.message;else toast(err.message);}
+ }catch(err){if(errEl&&errEl.isConnected)showError(errEl,err);else toast(err.message);}
  finally{if(submit.isConnected){submit.disabled=false;submit.innerHTML=original;}}
 });
 let bootRetries=0;

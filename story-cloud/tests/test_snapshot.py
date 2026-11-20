@@ -149,3 +149,27 @@ async def test_view_never_runs_until_intent_is_saved(tmp_path):
     await tick(db,worker)
     assert gateway.calls==[]
     assert db.job(jid)['status']=='paused'
+
+
+@pytest.mark.asyncio
+async def test_restore_of_old_checkpoint_migrates_profile_schema(tmp_path):
+    remote=Remote()
+    transport=httpx.MockTransport(remote)
+    c=config(tmp_path/'old')
+    db=DB(c.data_dir/'state.sqlite3')
+    store=SnapshotStore(db,c,transport=transport)
+    assert await store.acquire()
+    store.ready=True
+    account(db,c)
+    db.execute('DROP TABLE account_profile')
+    await store.flush()
+    await store.close()
+    c2=config(tmp_path/'new')
+    db2=DB(c2.data_dir/'state.sqlite3')
+    restored=SnapshotStore(db2,c2,transport=transport)
+    assert await restored.acquire()
+    await restored.restore()
+    assert db2.public_account()['profile_loaded'] is False
+    db2.execute('INSERT INTO account_profile(id,first_name,last_name,updated_at) VALUES(1,?,?,?)',('Имя','',now()))
+    assert db2.public_account()['first_name']=='Имя'
+    await restored.client.aclose()

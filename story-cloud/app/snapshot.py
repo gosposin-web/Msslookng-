@@ -98,6 +98,7 @@ class SnapshotStore:
                         source.backup(target)
                 finally:
                     source.close()
+            self.db.initialize_schema()
             self.etag=response.headers['etag']
         except Exception:
             raise SnapshotError('Сохранение не расшифровано. Проверьте постоянный ключ сервера.') from None

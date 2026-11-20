@@ -1,6 +1,8 @@
 import asyncio
 import json
+import io
 import re
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -11,6 +13,7 @@ from telethon import TelegramClient, functions, types, errors
 from telethon.sessions import StringSession
 
 from .db import now
+from .account_access import AccountAccessError, inspect_account
 
 
 class TelegramError(ValueError):
@@ -74,6 +77,8 @@ def normalize_chat(value: str) -> str:
 
 
 def friendly_error(exc: Exception) -> str:
+    if isinstance(exc, AccountAccessError):
+        return str(exc)
     name = type(exc).__name__
     if name in {'ApiIdPublishedFloodError','ApiIdInvalidError'}:
         return 'Telegram отклонил параметры приложения. Укажите свои API ID и API Hash в дополнительных настройках подключения.'
@@ -131,9 +136,11 @@ class TelegramGateway:
             receive_updates=False, flood_sleep_threshold=0, request_retries=0,
             connection_retries=1, retry_delay=1, timeout=10)
         await self.client.connect()
-        if not await self.client.is_user_authorized():
+        try:
+            await inspect_account(self.client)
+        except BaseException:
             await self.close()
-            raise TelegramError('Сессия истекла. Подключите аккаунт заново.')
+            raise
         return self.client
 
     async def import_tdata(self, folder: Path, api_id: int, api_hash: str,
@@ -143,9 +150,11 @@ class TelegramGateway:
         from opentele.api import UseCurrentSession
         desktop = await asyncio.to_thread(TDesktop, str(folder), passcode=passcode)
         if not desktop.isLoaded() or not desktop.mainAccount:
-            raise TelegramError('В tdata не найден активный аккаунт.')
+            raise AccountAccessError('TDATA_INVALID','В tdata не найден активный аккаунт.',
+                                     'Создайте свежий архив файлов авторизации Telegram Desktop.')
         client = None
         desktop_client = None
+        persisted = False
         try:
             # Use the Desktop authorization only to accept a fresh, separate cloud login.
             # Manage both clients explicitly: opentele's QR helper leaks clients on errors.
@@ -153,27 +162,31 @@ class TelegramGateway:
                 receive_updates=False, flood_sleep_threshold=0, request_retries=0,
                 connection_retries=1, timeout=10)
             await desktop_client.connect()
-            if not await desktop_client.is_user_authorized():
-                raise TelegramError('Сессия в tdata уже завершена или отозвана.')
+            original = await inspect_account(desktop_client)
             client = TelegramClient(StringSession(),api_id,api_hash,
                 device_model='Story Cloud',system_version='Cloud Linux',app_version='1.0',
                 receive_updates=True,flood_sleep_threshold=0,request_retries=0,
                 connection_retries=1,timeout=10)
             await client.connect()
             await authorize_cloud(desktop_client,client,password)
-            if not await client.is_user_authorized():
-                raise TelegramError('Не удалось авторизовать облачную сессию.')
-            me = await client.get_me()
+            me = await inspect_account(client)
+            if me.id != original.id:
+                raise AccountAccessError('ACCOUNT_MISMATCH','Telegram вернул другой аккаунт. Импорт отменён.')
             credential = self.cipher.encrypt(json.dumps({
                 'session':StringSession.save(client.session),'api_id':api_id,'api_hash':api_hash
             }).encode())
             await self.close()
-            self.db.execute('INSERT INTO account(id,user_id,name,username,credential,created_at) VALUES(1,?,?,?,?,?)',
-                            (str(me.id), display_name(me), me.username, credential, now()))
-            self.db.event('Аккаунт подключён. Создана отдельная облачная сессия.')
+            with self.db.connect() as c:
+                c.execute('INSERT INTO account(id,user_id,name,username,credential,created_at) VALUES(1,?,?,?,?,?)',
+                          (str(me.id), display_name(me), me.username, credential, now()))
+                c.execute('INSERT INTO account_profile(id,first_name,last_name,updated_at) VALUES(1,?,?,?)',
+                          (me.first_name or '',me.last_name or '',now()))
+                c.execute('INSERT INTO events(level,message,created_at) VALUES(?,?,?)',
+                          ('info','Аккаунт подключён. Создана отдельная облачная сессия.',now()))
+            persisted = True
         except BaseException:
             # Revoke a newly created cloud authorization if it could not be persisted.
-            if client:
+            if client and not persisted:
                 try:
                     await asyncio.wait_for(client.log_out(), timeout=5)
                 except Exception:
@@ -181,9 +194,73 @@ class TelegramGateway:
             raise
         finally:
             if client:
-                await client.disconnect()
+                with suppress(Exception):
+                    await client.disconnect()
             if desktop_client:
-                await desktop_client.disconnect()
+                with suppress(Exception):
+                    await desktop_client.disconnect()
+
+    def cache_profile(self, me, photo=None, *, replace_photo=False, photo_id=None):
+        if str(me.id) != self.db.account()['user_id']:
+            raise AccountAccessError('ACCOUNT_MISMATCH','Сессия не соответствует подключённому аккаунту.')
+        with self.db.connect() as c:
+            c.execute('UPDATE account SET name=?,username=? WHERE id=1', (display_name(me),me.username))
+            c.execute('''INSERT INTO account_profile(id,first_name,last_name,updated_at) VALUES(1,?,?,?)
+                         ON CONFLICT(id) DO UPDATE SET first_name=excluded.first_name,last_name=excluded.last_name,updated_at=excluded.updated_at''',
+                      (me.first_name or '', me.last_name or '', now()))
+            if replace_photo:
+                c.execute('UPDATE account_profile SET photo=?,photo_id=?,photo_revision=? WHERE id=1',
+                          (photo, photo_id or '', uuid.uuid4().hex))
+        return self.db.public_account()
+
+    async def read_profile(self):
+        client = await self.client_for_account()
+        me = await inspect_account(client)
+        photo_id = str(getattr(getattr(me,'photo',None),'photo_id','') or '')
+        saved = self.db.one('SELECT photo_id,photo IS NOT NULL AS has_photo FROM account_profile WHERE id=1')
+        if not saved or saved['photo_id'] != photo_id or (photo_id and not saved['has_photo']):
+            photo = await client.download_profile_photo(me, file=bytes, download_big=False) if photo_id else None
+            if photo is not None and len(photo) > 5*1024*1024:
+                raise AccountAccessError('PHOTO_SIZE','Telegram вернул слишком большую фотографию профиля.')
+            return self.cache_profile(me, photo, replace_photo=True, photo_id=photo_id)
+        return self.cache_profile(me)
+
+    async def change_name(self, first_name, last_name):
+        first_name, last_name = first_name.strip(), last_name.strip()
+        if not first_name or max(len(first_name),len(last_name)) > 64 or any(c in first_name+last_name for c in '\r\n\x00'):
+            raise TelegramError('Имя обязательно. Имя и фамилия — до 64 символов, без переноса строки.')
+        client = await self.client_for_account()
+        me = await inspect_account(client)
+        if first_name != (me.first_name or '') or last_name != (me.last_name or ''):
+            me = await client(functions.account.UpdateProfileRequest(first_name=first_name,last_name=last_name))
+        return self.cache_profile(me)
+
+    async def change_username(self, username):
+        username = username.strip().removeprefix('@')
+        if username and not re.fullmatch(r'[A-Za-z0-9_]{5,32}',username):
+            raise TelegramError('Username: 5–32 латинские буквы, цифры или подчёркивания. Пустое поле удаляет username.')
+        client = await self.client_for_account()
+        me = await inspect_account(client)
+        if username == (me.username or ''):
+            return self.cache_profile(me)
+        if username and username.casefold() != (me.username or '').casefold():
+            if not await client(functions.account.CheckUsernameRequest(username)):
+                raise AccountAccessError('USERNAME_OCCUPIED','Этот username недоступен.','Выберите другой username.')
+        try:
+            me = await client(functions.account.UpdateUsernameRequest(username))
+        except errors.UsernameNotModifiedError:
+            me = await inspect_account(client)
+        return self.cache_profile(me)
+
+    async def change_avatar(self, photo, thumbnail):
+        client = await self.client_for_account()
+        me = await inspect_account(client)
+        upload = io.BytesIO(photo)
+        upload.name = 'avatar.jpg'
+        file = await client.upload_file(upload)
+        result = await client(functions.photos.UploadProfilePhotoRequest(file=file))
+        # The RPC's photo is authoritative; no second write or automatic retry.
+        return self.cache_profile(me,thumbnail,replace_photo=True,photo_id=str(result.photo.id))
 
     async def resolve(self, ref):
         client = await self.client_for_account()

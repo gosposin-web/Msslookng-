@@ -14,6 +14,11 @@ class DB:
     def __init__(self, path: Path):
         self.path = path
         self.on_change = None
+        self.initialize_schema()
+        self.path.chmod(0o600)
+
+    def initialize_schema(self):
+        # Also run after restoring a checkpoint written by an older version.
         with self.connect() as c:
             c.executescript('''
                 PRAGMA journal_mode=WAL;
@@ -21,6 +26,11 @@ class DB:
                     id INTEGER PRIMARY KEY CHECK(id=1), user_id TEXT NOT NULL,
                     name TEXT NOT NULL, username TEXT, credential BLOB NOT NULL,
                     created_at INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS account_profile (
+                    id INTEGER PRIMARY KEY REFERENCES account(id) ON DELETE CASCADE CHECK(id=1),
+                    first_name TEXT NOT NULL DEFAULT '', last_name TEXT NOT NULL DEFAULT '',
+                    photo BLOB, photo_id TEXT NOT NULL DEFAULT '', photo_revision TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS sources (
                     id TEXT PRIMARY KEY, ref TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
                     mode TEXT NOT NULL, max_users INTEGER NOT NULL, created_at INTEGER NOT NULL);
@@ -59,7 +69,6 @@ class DB:
                     ip TEXT NOT NULL, created_at INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS runtime (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
             ''')
-        self.path.chmod(0o600)
 
     @contextmanager
     def connect(self):
@@ -92,6 +101,19 @@ class DB:
 
     def account(self):
         return self.one('SELECT * FROM account WHERE id=1')
+
+    def public_account(self):
+        account = self.account()
+        if not account:
+            return None
+        profile = self.one('SELECT first_name,last_name,photo_revision,updated_at,photo IS NOT NULL AS has_avatar FROM account_profile WHERE id=1')
+        return {k:account[k] for k in ('user_id','name','username','created_at')} | {
+            'first_name':profile['first_name'] if profile else None,
+            'last_name':profile['last_name'] if profile else None,
+            'has_avatar':bool(profile and profile['has_avatar']),
+            'photo_revision':profile['photo_revision'] if profile else '',
+            'profile_loaded':bool(profile),
+        }
 
     def event(self, message, job_id=None, level='info'):
         with self.connect() as c:

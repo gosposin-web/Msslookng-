@@ -55,3 +55,13 @@ test('Service readiness returns metadata without credentials or account data',as
   assert.deepEqual(await r.json(),{ready:true,mode:'free',checkpoint_saved:true,checkpoint_bytes:4096});
  }finally{globalThis.fetch=previous;}
 });
+test('Avatar cache validation stays private and forwards only the photo ETag',async()=>{
+ const e=env();e.BACKEND_URL='https://backend.test';
+ const previous=globalThis.fetch;let forwarded;
+ globalThis.fetch=async(url,options)=>{forwarded=options.headers;return new Response(null,{status:304,headers:{ETag:'"revision"','Cache-Control':'private, max-age=300'}});};
+ try{
+  const r=await worker.fetch(request('/api/account/profile/photo?v=revision','GET',{'oai-authenticated-user-id':'owner','If-None-Match':'"revision"','Cookie':'private-session'}),e);
+  assert.equal(r.status,304);assert.equal(r.headers.get('cache-control'),'private, max-age=300');
+  assert.equal(forwarded.get('if-none-match'),'"revision"');assert.equal(forwarded.get('cookie'),null);
+ }finally{globalThis.fetch=previous;}
+});

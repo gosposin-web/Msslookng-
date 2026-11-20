@@ -76,14 +76,15 @@ export default {
    if(!['GET','HEAD','OPTIONS'].includes(request.method)&&incomingOrigin&&incomingOrigin!==url.origin)return json({detail:'Запрос с другого сайта отклонён.'},403);
    // Never forward the Site's sign-in cookies, bearer tokens or other visitor headers.
    const headers=new Headers();
-   for(const name of ['accept','content-type','content-length','x-csrf-token'])if(request.headers.has(name))headers.set(name,request.headers.get(name));
+   for(const name of ['accept','content-type','content-length','x-csrf-token','if-none-match'])if(request.headers.has(name))headers.set(name,request.headers.get(name));
    headers.set('X-Story-Bridge-Secret',env.STORY_BRIDGE_SECRET);
    headers.set('X-Story-User',user);
    headers.set('Origin',url.origin);
    let response;
    try{response=await fetch(new URL(url.pathname+url.search,env.BACKEND_URL),{method:request.method,headers,body:['GET','HEAD'].includes(request.method)?undefined:request.body,redirect:'manual'});}
    catch{return json({detail:'Бесплатный сервер просыпается. Повторите через минуту.'},503);}
-   const out=new Headers(response.headers);out.delete('set-cookie');out.set('Cache-Control','no-store');
+   const out=new Headers(response.headers);out.delete('set-cookie');
+   if(!(request.method==='GET'&&url.pathname==='/api/account/profile/photo'&&(response.ok||response.status===304)))out.set('Cache-Control','no-store');
    return new Response(response.body,{status:response.status,headers:out});
   }
   if(request.method!=='GET'&&request.method!=='HEAD')return json({error:'Method not allowed'},405);
