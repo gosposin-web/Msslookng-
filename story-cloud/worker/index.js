@@ -23,6 +23,18 @@ async function boundedBody(request,limit){
 export default {
  async fetch(request,env){
   const url=new URL(request.url);
+  if(url.pathname==='/service-health'&&request.method==='GET'){
+   // Owner-private dispatch also authorizes the existing Site service credential.
+   // Return only readiness and encrypted-file metadata, never account data or keys.
+   if(!env.BACKEND_URL||!env.BUCKET)return json({ready:false,checkpoint_saved:false},503);
+   try{
+    const [response,checkpoint]=await Promise.all([
+     fetch(new URL('/health',env.BACKEND_URL)),env.BUCKET.head(CHECKPOINT)]);
+    const health=await response.json();
+    return json({ready:health.ok===true&&health.ready===true,mode:health.mode,
+     checkpoint_saved:Boolean(checkpoint),checkpoint_bytes:checkpoint?.size||0});
+   }catch{return json({ready:false,checkpoint_saved:false},503);}
+  }
   if(url.pathname.startsWith('/internal/')){
    // Dispatch validates the private Site credential. This second key scopes backend calls.
    if(!await equalSecret(request.headers.get('X-Story-Cloud-Key'),env.STORY_BRIDGE_SECRET))return json({error:'Forbidden'},403);

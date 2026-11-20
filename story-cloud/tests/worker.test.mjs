@@ -45,3 +45,13 @@ test('Cross-origin mutations and identity-less proxy requests are rejected',asyn
  assert.equal((await worker.fetch(request('/api/state'),e)).status,401);
  assert.equal((await worker.fetch(request('/api/sources','POST',{'oai-authenticated-user-id':'owner','Origin':'https://evil.test'},'{}'),e)).status,403);
 });
+test('Service readiness returns metadata without credentials or account data',async()=>{
+ const e=env();e.BACKEND_URL='https://backend.test';
+ e.BUCKET.head=async()=>({size:4096});
+ const previous=globalThis.fetch;
+ globalThis.fetch=async()=>Response.json({ok:true,ready:true,mode:'free'});
+ try{
+  const r=await worker.fetch(new Request('https://private.test/service-health'),e);
+  assert.deepEqual(await r.json(),{ready:true,mode:'free',checkpoint_saved:true,checkpoint_bytes:4096});
+ }finally{globalThis.fetch=previous;}
+});
