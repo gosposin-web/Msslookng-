@@ -1,0 +1,167 @@
+'use strict';
+const paths={
+ dashboard:`<rect x='3' y='3' width='7' height='7' rx='1.5'/><rect x='14' y='3' width='7' height='7' rx='1.5'/><rect x='3' y='14' width='7' height='7' rx='1.5'/><rect x='14' y='14' width='7' height='7' rx='1.5'/>`,
+ chat:`<path d='M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8z'/><path d='M8 11h8'/>`,
+ people:`<path d='M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2m20 0v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8'/><circle cx='9' cy='7' r='4'/>`,
+ jobs:`<rect x='5' y='5' width='14' height='16' rx='2'/><path d='M9 3h6v4H9zm0 8h6m-6 4h6m-6 3h3'/>`,
+ account:`<circle cx='12' cy='8' r='4'/><path d='M4 21v-2a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v2'/>`,
+ plus:`<path d='M12 5v14M5 12h14'/>`,
+ cloud:`<path d='M20 16.5a4.5 4.5 0 0 0-1-8.9A7 7 0 0 0 5.1 8.8a4 4 0 0 0 .9 7.7h14z'/>`,
+ eye:`<path d='M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z'/><circle cx='12' cy='12' r='3'/>`,
+ story:`<path d='M8 3.8a9 9 0 0 1 8 0M20.3 8a9 9 0 0 1 0 8M16 20.3a9 9 0 0 1-8 0M3.7 16a9 9 0 0 1 0-8'/><path d='m10 8 6 4-6 4z'/>`,
+ clock:`<circle cx='12' cy='12' r='9'/><path d='M12 7v5l3 2'/>`,
+ lock:`<rect x='5' y='10' width='14' height='11' rx='2'/><path d='M8 10V7a4 4 0 0 1 8 0v3m-4 5v2'/>`,
+ check:`<path d='m5 12 4 4L19 6'/>`,
+ info:`<circle cx='12' cy='12' r='9'/><path d='M12 11v6m0-10h.01'/>`,
+ search:`<circle cx='10.5' cy='10.5' r='6.5'/><path d='m16 16 4.5 4.5'/>`,
+ trash:`<path d='M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7'/>`,
+ play:`<path d='m8 5 11 7-11 7z'/>`,
+ pause:`<path d='M8 5v14m8-14v14'/>`,
+ stop:`<rect x='6' y='6' width='12' height='12' rx='1'/>`,
+ download:`<path d='M12 3v12m-5-5 5 5 5-5M4 15v6h16v-6'/>`,
+ close:`<path d='m6 6 12 12M6 18 18 6'/>`,
+ logout:`<path d='M9 5H4v14h5m4-13 6 6-6 6m-5-6h11'/>`,
+ refresh:`<path d='M20 7v5h-5M4 17v-5h5m10.5-4.5a8 8 0 0 0-13.2-3M4.5 16.5a8 8 0 0 0 13.2 3'/>`
+};
+const icon=n=>`<svg viewBox='0 0 24 24' aria-hidden='true'>${paths[n]||paths.info}</svg>`;
+const esc=v=>String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll("'",'&#39;').replaceAll(String.fromCharCode(34),'&quot;');
+const number=v=>new Intl.NumberFormat('ru-RU').format(v||0);
+const date=v=>v?new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}).format(v*1000):'—';
+const initials=n=>String(n||'?').split(' ').filter(Boolean).slice(0,2).map(x=>x[0]).join('').toUpperCase();
+const labels={overview:'Обзор',sources:'Чаты',audience:'Аудитория',jobs:'Задания',account:'Аккаунт'};
+const navIcons={overview:'dashboard',sources:'chat',audience:'people',jobs:'jobs',account:'account'};
+const statuses={queued:'В очереди',running:'Выполняется',waiting:'Ожидание',paused:'На паузе',done:'Завершено',failed:'Ошибка',cancelled:'Остановлено'};
+let state={account:null,sources:[],jobs:[],events:[],stats:{people:0,active:0,views_24h:0},view_limit_24h:200,cooldown_until:0};
+let server=false,authenticated=false,csrf='',page='overview',people=[],totalPeople=0,offset=0,activeOnly=true,search='',source='',selected=new Set(),polling=false,searchTimer;
+const app=document.querySelector('#app');
+const dialog=document.querySelector('#dialog');
+let toastTimer;
+
+function toast(message){const el=document.querySelector('#toast');el.textContent=message;el.classList.add('visible');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('visible'),6500);}
+function online(){if(server&&authenticated)return true;toast(server?'Войдите в панель.':'Сервер Telegram ещё не запущен. Сейчас доступен просмотр интерфейса.');return false;}
+async function api(path,options={}){
+ const headers={Accept:'application/json',...options.headers};
+ if(options.method&&options.method!=='GET')headers['X-CSRF-Token']=csrf;
+ if(options.body&&!(options.body instanceof FormData)){headers['Content-Type']='application/json';options.body=JSON.stringify(options.body);}
+ const response=await fetch(path,{...options,headers,credentials:'same-origin'});
+ let data;try{data=await response.json();}catch{throw new Error('Сервер не ответил. Повторите позже.');}
+ if(!response.ok){if(response.status===401&&server&&path!=='/api/auth/login'){authenticated=false;showLogin();}const error=new Error(Array.isArray(data.detail)?'Проверьте значения полей.':data.detail||'Не удалось выполнить действие.');error.status=response.status;throw error;}
+ return data;
+}
+function nav(mobile=false){return Object.entries(labels).map(([key,label])=>`<button type='button' class='${mobile?'':'nav-btn '}${page===key?'active':''}' data-tab='${key}' ${page===key?"aria-current='page'":''}>${icon(navIcons[key])}<span>${label}</span>${!mobile&&key==='audience'&&state.stats.people?`<span class='nav-count'>${number(state.stats.people)}</span>`:''}</button>`).join('');}
+function title(eyebrow,heading,sub,button=''){return `<div class='page-header'><div><div class='eyebrow'>${eyebrow}</div><h1>${heading}</h1><p class='subtitle'>${sub}</p></div>${button}</div>`;}
+function empty(type,heading,body,button=''){return `<div class='empty-state'><div class='empty-icon'>${icon(type)}</div><h3>${heading}</h3><p>${body}</p>${button}</div>`;}
+const button=(action,label,type='primary',extra='',symbol='')=>`<button type='button' class='btn ${type}' data-action='${action}' ${extra}>${symbol?icon(symbol):''}${label}</button>`;
+function render(){
+ app.innerHTML=`<div class='app-shell'><aside class='sidebar'><a class='brand' href='#' data-tab='overview'><img src='/assets/icon.svg' alt=''><div class='brand-name'>лупа<small>stories workspace</small></div></a><p class='nav-label'>РАБОЧЕЕ ПРОСТРАНСТВО</p><nav class='nav-list' aria-label='Основная навигация'>${nav()}</nav><div class='sidebar-foot'><div class='cloud-note'>${icon('cloud')}<span>Ваша работа — в облаке.<br>Управление — с телефона.</span></div><div class='account-mini'><div class='avatar'>${state.account?esc(initials(state.account.name)):icon('account')}</div><div><strong>${state.account?esc(state.account.name):'Личная панель'}</strong><small>${state.account?'Аккаунт подключён':'Аккаунт не подключён'}</small></div></div></div></aside><div class='workspace'><header class='topbar'><div class='mobile-brand'><img src='/assets/icon.svg' alt=''>лупа</div><div class='breadcrumb'><span>Личная панель</span><span>/</span><b>${labels[page]}</b></div><div class='topbar-actions'><span class='status-chip'><i class='dot ${state.account?'connected':''}'></i>${state.account?'На связи':server?'Нет аккаунта':'Предпросмотр'}</span><button type='button' class='icon-btn' data-action='help' aria-label='Помощь'>${icon('info')}</button></div></header><main class='content'>${!server?`<div class='banner'>${icon('info')}<span><b>Предпросмотр интерфейса.</b> Сервер Telegram ещё не запущен. Импорт и задания станут доступны после запуска.</span><button type='button' data-action='launch-info'>О запуске</button></div>`:''}${state.free_mode?`<div class='banner'>${icon('cloud')}<span><b>Бесплатный режим.</b> Через 15 минут без обращений сервер может заснуть. Сохранённые данные восстановятся при следующем открытии; пробуждение занимает около минуты.</span></div>`:''}${state.storage_error?`<div class='banner error-banner'>${icon('info')}<span>${esc(state.storage_error)}</span></div>`:''}${state.cooldown_until>Date.now()/1000?`<div class='banner'>${icon('clock')}<span>Telegram запросил паузу до ${esc(date(state.cooldown_until))}. Все задания ждут автоматически.</span></div>`:''}<div id='page-content'>${({overview:overview,sources:sourcesPage,audience:audiencePage,jobs:jobsPage,account:accountPage}[page])()}</div><div class='quiet-footer'>${icon('lock')}<span>Личное рабочее пространство. Действия выполняются только с подключённого аккаунта.</span></div></main></div><nav class='mobile-nav' aria-label='Навигация с телефона'>${nav(true)}</nav></div>`;
+ if(page==='audience')renderPeople();
+}
+function overview(){
+ const step=state.account?(state.sources.length?(state.stats.people?3:2):1):0;
+ const steps=[['Подключите аккаунт','Загрузите свой архив tdata.'],['Добавьте нужные чаты','Выберите источник аудитории.'],['Найдите активные истории','Проверьте людей и запустите просмотр.']];
+ return title('ВАШЕ РАБОЧЕЕ ПРОСТРАНСТВО','Всё под контролем','От нужного чата — к активной аудитории.',button('add-source','Добавить чат','primary','','plus'))+`<div class='welcome-grid'><section class='hero-card'><div><div class='eyebrow'>АУДИТОРИЯ НАЧИНАЕТСЯ С ИНТЕРЕСА</div><h2>${state.account?'Находите людей.<br>Работайте с историями.':'Нужные люди.<br>В нужных историях.'}</h2><p>${state.account?'Выберите чат, соберите аудиторию и проверьте доступные активные истории.':'Подключите аккаунт и соберите аудиторию из чатов, которые вам интересны.'}</p></div>${button(state.account?'go-sources':'go-account',state.account?'Перейти к чатам':'Подключить аккаунт','lime','',state.account?'chat':'plus')}<div class='orbit' aria-hidden='true'><span></span><i></i></div></section><section class='checklist-card'><div class='section-top'><h2>Первые шаги</h2><small>${Math.min(step,3)} из 3</small></div><div class='steps-list'>${steps.map((s,i)=>`<div class='step ${step>i?'done':step===i?'active':''}'><span class='step-number'>${step>i?icon('check'):i+1}</span><div><strong>${s[0]}</strong><p>${s[1]}</p></div></div>`).join('')}</div></section></div><div class='metrics'><section class='metric'><div class='metric-head'>Собрано пользователей${icon('people')}</div><div class='metric-value'>${number(state.stats.people)}</div><p class='metric-foot'>Уникальные люди из чатов</p></section><section class='metric'><div class='metric-head'>С активными историями${icon('story')}</div><div class='metric-value'>${number(state.stats.active)}</div><p class='metric-foot'><span>Доступны</span>По последней проверке</p></section><section class='metric'><div class='metric-head'>Просмотрено за 24 часа${icon('eye')}</div><div class='metric-value'>${number(state.stats.views_24h)}</div><p class='metric-foot'>Из ${state.view_limit_24h} по внутреннему лимиту</p></section></div><div class='bottom-grid'><section class='card'><div class='section-top'><h2>Последние задания</h2><button type='button' class='text-btn' data-tab='jobs'>Все задания</button></div>${state.jobs.length?state.jobs.slice(0,2).map(jobCard).join(''):empty('jobs','Пока всё спокойно','Задания появятся здесь, когда вы запустите сбор аудитории.')}</section><section class='card'><div class='section-top'><h2>Журнал событий</h2><small>Последние действия</small></div>${eventsView(5)}</section></div>`;
+}
+function sourcesPage(){return title('ИСТОЧНИКИ АУДИТОРИИ','Ваши чаты','Добавьте группы, доступные подключённому аккаунту.',button('add-source','Добавить чат','primary','','plus'))+(state.sources.length?state.sources.map(s=>`<article class='source-card'><div class='source-icon'>${icon('chat')}</div><div class='source-info'><h3>${esc(s.title)}</h3><p>${esc(s.ref)}</p><div class='source-meta'><span>${s.mode==='authors'?'Авторы сообщений':'Участники группы'}</span><span>До ${number(s.max_users)} человек</span><span>Собрано: ${number(s.collected)}</span></div></div><div class='source-actions'>${button('scan-source','Собрать','primary small',`data-id='${esc(s.id)}'`,'search')}${button('source-people','Аудитория','light small',`data-id='${esc(s.id)}'`)}<button type='button' class='round-btn' data-action='delete-source' data-id='${esc(s.id)}' aria-label='Удалить чат'>${icon('trash')}</button></div></article>`).join(''):`<section class='card'>${empty('chat','Начните с одного чата','Укажите ссылку или @username группы. После сбора здесь появятся её название и количество найденных людей.',button('add-source','Добавить первый чат','light','','plus'))}</section>`)+`<div class='notice'>${icon('info')}<span>Если список участников скрыт, можно собрать авторов доступных сообщений. Аккаунт должен иметь доступ к переписке. Приватность историй учитывается при проверке.</span></div>`;}
+function audiencePage(){return title('ЛЮДИ И ИХ ИСТОРИИ','Аудитория','Выберите людей, чьи активные истории нужно посмотреть.',button('export','Скачать CSV','light','','download'))+`<div class='toolbar'><div class='search-box'>${icon('search')}<input id='people-search' aria-label='Поиск по аудитории' placeholder='Имя, username или ID' value='${esc(search)}' autocomplete='off'></div><select id='source-filter' class='filter-select' aria-label='Фильтр по чату'><option value=''>Все чаты</option>${state.sources.map(s=>`<option value='${esc(s.id)}' ${source===s.id?'selected':''}>${esc(s.title)}</option>`).join('')}</select><div class='segmented' aria-label='Фильтр историй'><button class='segment ${activeOnly?'active':''}' data-action='filter-active'>С историями</button><button class='segment ${!activeOnly?'active':''}' data-action='filter-all'>Все</button></div></div><div id='audience-data'></div><div id='selection'></div>`;}
+function renderPeople(){
+ const el=document.querySelector('#audience-data');if(!el)return;
+ el.innerHTML=people.length?`<div class='table-wrap'><table class='people-table'><thead><tr><th><input type='checkbox' id='select-page' aria-label='Выбрать доступных на странице' ${people.filter(p=>p.stories_count).every(p=>selected.has(p.user_id))?'checked':''}></th><th>Пользователь</th><th>Истории</th><th class='desktop-only'>Проверено</th><th>Просмотров</th></tr></thead><tbody>${people.map(p=>`<tr><td><input type='checkbox' data-person='${esc(p.user_id)}' aria-label='Выбрать ${esc(p.name)}' ${selected.has(p.user_id)?'checked':''} ${!p.stories_count?'disabled':''}></td><td><div class='person-name'><span class='avatar'>${esc(initials(p.name))}</span><div><strong>${esc(p.name)}</strong><small>${p.username?'@'+esc(p.username):'ID '+esc(p.user_id)}</small></div></div></td><td>${p.stories_count?`<span class='tag ready'>${p.stories_count} активн.</span>`:`<span class='muted'>Нет</span>`}</td><td class='desktop-only muted'>${esc(date(p.checked_at))}</td><td class='muted'>${p.viewed_count||0}</td></tr>`).join('')}</tbody></table></div><div class='pagination'><span>${offset+1}–${offset+people.length} из ${number(totalPeople)}</span><div>${button('prev-page','Назад','light small',offset===0?'disabled':'')}${button('next-page','Далее','light small',offset+people.length>=totalPeople?'disabled':'')}</div></div>`:`<section class='card'>${empty('people',search?'Никого не нашли':activeOnly?'Активные истории ещё не найдены':'Аудитория пока пуста',search?'Попробуйте другое имя или username.':'Добавьте чат и запустите сбор. Люди с доступными историями появятся здесь.',!search?button('go-sources','Перейти к чатам','light','','chat'):'')}</section>`;
+ renderSelection();
+}
+function renderSelection(){const el=document.querySelector('#selection');if(el)el.innerHTML=selected.size?`<div class='selection-bar'><span>Выбрано: <strong>${number(selected.size)}</strong></span><div>${button('clear-selection','Снять','small')}${button('confirm-view','Смотреть истории','lime small','','play')}</div></div>`:'';}
+function jobCard(j){
+ const sourceRow=state.sources.find(s=>s.id===j.source_id);
+ const scanning=j.kind==='scan';
+ const progress=j.status==='done'?100:j.total?Math.min(100,Math.round(j.checked/j.total*100)):0;
+ return `<article class='job-card'><div class='job-head'><div class='job-title'><div class='source-icon'>${icon(scanning?'search':'eye')}</div><div><h3>${scanning?'Сбор аудитории':'Просмотр историй'}</h3><small>${scanning?esc(sourceRow?.title||'Чат'):number(j.total)+' пользователей'} · ${esc(date(j.created_at))}</small></div></div><span class='tag ${esc(j.status)}'>${statuses[j.status]||esc(j.status)}</span></div><div class='progress-track'><div class='progress-fill' style='width:${progress}%'></div></div><div class='job-summary'><span>Проверено ${number(j.checked)} из ${number(j.total)}</span><span>${scanning?'С историями: '+number(j.found):'Просмотров: '+number(j.viewed)}</span></div><p class='job-note'>${esc(j.message||'Ожидает выполнения.')}${j.status==='waiting'&&j.next_run>Date.now()/1000?' До '+esc(date(j.next_run))+'.':''}</p>${['queued','running','waiting','paused','failed'].includes(j.status)?`<div class='job-controls'>${['paused','failed'].includes(j.status)?button('job-resume','Продолжить','light small',`data-id='${esc(j.id)}'`,'play'):button('job-pause','Пауза','light small',`data-id='${esc(j.id)}'`,'pause')}${button('job-cancel','Остановить','light small',`data-id='${esc(j.id)}'`,'stop')}</div>`:''}</article>`;
+}
+function eventsView(max=20){return state.events.length?state.events.slice(0,max).map(e=>`<div class='event'><i class='event-mark ${esc(e.level)}'></i><div><p>${esc(e.message)}</p><time>${esc(date(e.created_at))}</time></div></div>`).join(''):empty('clock','Ничего не пропущено','Подключения, результаты и паузы Telegram будут записаны здесь.');}
+function jobsPage(){return title('ФОНОВАЯ РАБОТА','Задания',state.free_mode?'Сервер работает до перехода в сон. После пробуждения задания восстановятся из сохранения.':'После запуска можно закрыть страницу — сервер продолжит работу.',button('refresh','Обновить','light','','refresh'))+`<div class='bottom-grid'><section>${state.jobs.length?state.jobs.map(jobCard).join(''):`<div class='card'>${empty('jobs','Очередь пуста','Начните со сбора аудитории из одного чата.',button('go-sources','Выбрать чат','light','','chat'))}</div>`}</section><section class='card'><div class='section-top'><h2>Журнал</h2><small>Последние события</small></div>${eventsView()}</section></div>`;}
+function accountPage(){
+ let body;
+ if(state.account){body=`<h2>Аккаунт подключён</h2><p class='form-intro'>Облачная сессия готова к работе.</p><div class='connected-account'><span class='avatar'>${esc(initials(state.account.name))}</span><div><h3>${esc(state.account.name)}</h3><p>${state.account.username?'@'+esc(state.account.username):'ID '+esc(state.account.user_id)}</p></div></div><div class='notice'>${icon('lock')}<span>Создана отдельная сессия Story Cloud. Её можно завершить здесь или в разделе «Устройства» в Telegram.</span></div><p class='form-intro'>Подключён ${esc(date(state.account.created_at))}. Архив tdata после импорта удалён.</p>${button('confirm-disconnect','Отключить аккаунт','danger','','logout')}`;}
+ else body=`<h2>Подключение через tdata</h2><p class='form-intro'>Загрузите ZIP с папкой tdata. Из архива будет выбран активный аккаунт Telegram Desktop.</p>${!server?`<div class='notice warning'>${icon('cloud')}<span>Импорт откроется после запуска сервера. В предпросмотре файлы не загружаются и данные аккаунта не запрашиваются.</span></div>`:''}<form id='tdata-form'><fieldset ${!server?'disabled':''}><label class='field'><span>Архив tdata</span><input name='file' type='file' accept='.zip,application/zip' required><small>ZIP до 20 МБ. Файлы авторизации без кэша и медиа.</small></label>${!state.telegram_api_configured?`<div class='field-row'><label class='field'><span>API ID</span><input name='api_id' type='text' inputmode='numeric' pattern='[0-9]+' placeholder='12345678' required autocomplete='off'></label><label class='field'><span>API Hash</span><input name='api_hash' type='password' placeholder='32 символа' minlength='32' maxlength='32' required autocomplete='off'></label></div><p class='links-inline'>Параметры своего приложения: <a href='https://my.telegram.org/apps' target='_blank' rel='noopener noreferrer'>my.telegram.org</a>. Их достаточно ввести при подключении.</p>`:''}<details><summary>Пароли, если они установлены</summary><label class='field'><span>Код-пароль Telegram Desktop</span><input name='passcode' type='password' autocomplete='off' maxlength='512' placeholder='Если tdata зашифрована'><small>Локальный код-пароль исходного Telegram Desktop.</small></label><label class='field'><span>Пароль двухэтапной проверки</span><input name='password' type='password' autocomplete='off' maxlength='512' placeholder='Если включена в Telegram'><small>Нужен Telegram для создания отдельной облачной сессии.</small></label></details><div id='import-error' class='inline-error' role='alert'></div><div class='form-bottom'><small>Пароли и исходный архив не сохраняются после импорта.</small><button type='submit' class='btn primary'>${icon('lock')}Подключить аккаунт</button></div></fieldset></form>`;
+ return title('ЛИЧНОЕ ПОДКЛЮЧЕНИЕ','Аккаунт','Один аккаунт. Отдельная облачная сессия.')+`<div class='account-grid'><section class='card'>${body}</section><aside class='card'><h2>Перед подключением</h2><div class='help-item'><h3>tdata — формат Desktop</h3><p>Нужен уже имеющийся архив вашего Telegram Desktop. Сам мобильный Telegram такой архив не создаёт.</p></div><div class='help-item'><h3>Доступ к аккаунту</h3><p>tdata содержит ключи входа. Загружайте только свой архив в свою панель. Подключение доступно после входа по паролю панели.</p></div><div class='help-item'><h3>Постоянное хранение</h3><p>Сессия хранится на сервере в зашифрованном виде. При отключении данные сессии и собранная аудитория удаляются из приложения.</p></div><div class='help-item'><h3>Ограничения Telegram</h3><p>Запросы ожидания соблюдаются автоматически. Внутренние лимиты приложения не гарантируют отсутствие ограничений аккаунта.</p></div></aside></div>${server?`<div class='footer-logout'>${state.auth_mode==='chatgpt'?`<a class='btn light' href='/signout-with-chatgpt?return_to=%2F' target='_top'>${icon('logout')}Выйти из панели</a>`:button('logout','Выйти из панели','light','','logout')}</div>`:''}`;
+}
+function showDialog(content,login=false){dialog.innerHTML=`<div class='dialog-inner'>${content}</div>`;dialog.dataset.login=login?'true':'false';if(!dialog.open)dialog.showModal();}
+function dialogTitle(t){return `<div class='dialog-title'><h2>${t}</h2><button type='button' class='round-btn' data-action='close-dialog' aria-label='Закрыть'>${icon('close')}</button></div>`;}
+function showLogin(){showDialog(`<div class='dialog-title'><h2>Вход в личную панель</h2></div><p>Введите пароль, заданный при запуске сервера.</p><form id='login-form'><label class='field'><span>Пароль панели</span><input name='password' type='password' autocomplete='current-password' required autofocus></label><div id='login-error' class='inline-error' role='alert'></div><button class='btn primary' type='submit'>Войти в панель</button></form>`,true);}
+function addSource(){showDialog(dialogTitle('Добавить чат')+`<p>Укажите группу, к которой есть доступ у подключённого аккаунта.</p><form id='source-form'><label class='field'><span>Ссылка или username группы</span><input name='ref' placeholder='t.me/название_группы' required maxlength='200' autocomplete='off' autocapitalize='off'></label><label class='mode-choice'><input type='radio' name='mode' value='members' checked><span><strong>Участники группы</strong><small>Люди из доступного аккаунту списка участников.</small></span></label><label class='mode-choice'><input type='radio' name='mode' value='authors'><span><strong>Авторы сообщений</strong><small>Авторы из доступной переписки, до 5 000 последних сообщений.</small></span></label><label class='field' style='margin-top:19px'><span>Сколько людей собрать</span><input name='max_users' type='number' inputmode='numeric' min='1' max='5000' value='300' required><small>Начните с небольшой аудитории. Проверка историй запускается в этом же задании.</small></label><div id='source-error' class='inline-error' role='alert'></div><div class='dialog-actions'>${button('close-dialog','Отмена','light')}<button class='btn primary' type='submit'>Добавить чат</button></div></form>`);}
+function viewDialog(){if(!selected.size)return;showDialog(dialogTitle('Смотреть выбранные истории')+`<p>Выбрано пользователей: <strong>${number(selected.size)}</strong>. Перед просмотром доступность историй будет проверена повторно. Уже просмотренные истории пропускаются.</p><form id='view-form'><label class='field'><span>Интервал между пользователями, сек.</span><input name='delay' type='number' inputmode='numeric' min='5' max='300' value='15' required><small>Внутренний предел приложения — ${state.view_limit_24h} историй за 24 часа. Запросы ожидания Telegram имеют приоритет.</small></label><div class='inline-error' id='view-error' role='alert'></div><div class='dialog-actions'>${button('close-dialog','Отмена','light')}<button class='btn primary' type='submit'>${icon('play')}Запустить</button></div></form>`);}
+async function sync(renderAfter=true){if(!server||!authenticated)return;state=await api('/api/state');if(page==='audience')await loadPeople();else if(renderAfter)render();}
+async function loadPeople(){if(!server||!authenticated){people=[];totalPeople=0;renderPeople();return;}const q=new URLSearchParams({search,source,active:String(activeOnly),offset:String(offset)});const d=await api('/api/people?'+q);people=d.people;totalPeople=d.total;renderPeople();}
+async function go(next){page=next;if(next==='audience'){render();await loadPeople();}else render();window.scrollTo({top:0,behavior:'instant'});}
+dialog.addEventListener('cancel',e=>{if(dialog.dataset.login==='true')e.preventDefault();});
+document.addEventListener('click',async e=>{
+ const target=e.target.closest('[data-action],[data-tab]');if(!target)return;
+ e.preventDefault();if(target.disabled)return;
+ if(target.dataset.tab){try{await go(target.dataset.tab);}catch(err){toast(err.message);}return;}
+ const action=target.dataset.action,id=target.dataset.id;
+ try{
+  if(action==='close-dialog'){if(dialog.dataset.login!=='true')dialog.close();return;}
+  if(action==='retry-boot'){bootRetries=0;await boot();return;}
+  if(action==='add-source'){addSource();return;}
+  if(action.startsWith('go-')){await go(action.slice(3));return;}
+  if(action==='help'||action==='launch-info'){showDialog(dialogTitle(server?'Как это работает':'Запуск облачной панели')+(server?`<ol class='help-list'><li>Подключите свой аккаунт через ZIP с tdata.</li><li>Добавьте чат и нажмите «Собрать».</li><li>Во вкладке «Аудитория» выберите найденных людей с историями.</li><li>Запустите просмотр и проверяйте задания. Страницу можно закрыть.</li></ol>`:`<p>Интерфейс уже доступен с телефона. Для подключения tdata и работы заданий нужен постоянно работающий сервер с сохранением данных.</p><div class='notice'>${icon('cloud')}<span>Сервер ещё не подключён. Поэтому импорт и запуск заданий сейчас недоступны. После размещения сервер выдаст отдельную ссылку на рабочую панель.</span></div>`)+`<div class='dialog-actions'>${button('close-dialog','Понятно','primary')}</div>`);return;}
+  if(action==='clear-selection'){selected.clear();renderPeople();return;}
+  if(action==='confirm-view'){if(online())viewDialog();return;}
+  if(action==='filter-active'||action==='filter-all'){activeOnly=action==='filter-active';offset=0;selected.clear();render();await loadPeople();return;}
+  if(action==='source-people'){source=id;offset=0;selected.clear();await go('audience');return;}
+  if(!online())return;
+  target.disabled=true;
+  if(action==='scan-source'){await api(`/api/sources/${id}/scan`,{method:'POST'});toast('Сбор поставлен в очередь. Результаты появятся в аудитории.');await go('jobs');await sync();}
+  if(action==='delete-source'){showDialog(dialogTitle('Удалить чат?')+`<p>Чат будет удалён из источников. История завершённых заданий сохранится.</p><div class='dialog-actions'>${button('close-dialog','Отмена','light')}${button('delete-source-confirm','Удалить','danger',`data-id='${esc(id)}'`)}</div>`);}
+  if(action==='delete-source-confirm'){await api(`/api/sources/${id}`,{method:'DELETE'});dialog.close();await sync();toast('Чат удалён.');}
+  if(action.startsWith('job-')){await api(`/api/jobs/${id}/control`,{method:'POST',body:{action:action.slice(4)}});await sync();}
+  if(action==='refresh'){await sync();toast('Данные обновлены.');}
+  if(action==='prev-page'||action==='next-page'){offset=Math.max(0,offset+(action==='next-page'?100:-100));selected.clear();await loadPeople();}
+  if(action==='export'){const q=new URLSearchParams({search,source,active:String(activeOnly)});const r=await fetch('/api/people/export?'+q,{credentials:'same-origin'});if(!r.ok)throw new Error('Не удалось скачать аудиторию. Обновите страницу.');const url=URL.createObjectURL(await r.blob());const link=document.createElement('a');link.href=url;link.download='story-audience.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}
+  if(action==='confirm-disconnect'){showDialog(dialogTitle('Отключить аккаунт?')+`<p>Все его задания будут остановлены. Подключение, сессия и собранная аудитория будут удалены из приложения.</p><div class='dialog-actions'>${button('close-dialog','Отмена','light')}${button('disconnect','Отключить','danger')}</div>`);}
+  if(action==='disconnect'){target.textContent='Отключаем…';const result=await api('/api/account',{method:'DELETE'});selected.clear();dialog.close();await sync();toast(result.message);}
+  if(action==='logout'){await api('/api/auth/logout',{method:'POST'});authenticated=false;csrf='';state={account:null,sources:[],jobs:[],events:[],stats:{people:0,active:0,views_24h:0},view_limit_24h:200};page='overview';render();showLogin();}
+ }catch(err){toast(err.message);}finally{if(target.isConnected)target.disabled=false;}
+});
+document.addEventListener('change',async e=>{
+ try{
+ if(e.target.dataset.person){e.target.checked?selected.add(e.target.dataset.person):selected.delete(e.target.dataset.person);renderSelection();}
+ if(e.target.id==='select-page'){for(const p of people.filter(p=>p.stories_count)){e.target.checked?selected.add(p.user_id):selected.delete(p.user_id);}renderPeople();}
+ if(e.target.id==='source-filter'){source=e.target.value;offset=0;selected.clear();await loadPeople();}
+ }catch(err){toast(err.message);}
+});
+document.addEventListener('input',e=>{if(e.target.id==='people-search'){search=e.target.value;offset=0;clearTimeout(searchTimer);searchTimer=setTimeout(()=>loadPeople().catch(err=>toast(err.message)),300);}});
+document.addEventListener('submit',async e=>{
+ const form=e.target;if(!['login-form','source-form','tdata-form','view-form'].includes(form.id))return;e.preventDefault();
+ if(form.id!=='login-form'&&!online())return;
+ const submit=form.querySelector('[type=submit]');const original=submit.innerHTML;submit.disabled=true;
+ const errors={ 'login-form':'login-error','source-form':'source-error','tdata-form':'import-error','view-form':'view-error'};
+ const errEl=document.getElementById(errors[form.id]);if(errEl)errEl.textContent='';
+ try{
+  const data=new FormData(form);
+  if(form.id==='login-form'){const d=await api('/api/auth/login',{method:'POST',body:{password:data.get('password')}});csrf=d.csrf;authenticated=true;form.reset();dialog.dataset.login='false';dialog.close();await sync();}
+  if(form.id==='source-form'){await api('/api/sources',{method:'POST',body:{ref:data.get('ref'),mode:data.get('mode'),max_users:Number(data.get('max_users'))}});dialog.close();page='sources';await sync();toast('Чат добавлен. Теперь можно запустить сбор.');}
+  if(form.id==='tdata-form'){const file=data.get('file');if(!file||file.size>20*1024*1024)throw new Error('Выберите ZIP размером до 20 МБ.');submit.textContent='Подключаем… до 90 сек.';await api('/api/account/tdata',{method:'POST',body:data});form.reset();await sync();toast('Аккаунт подключён. Добавьте первый чат.');}
+  if(form.id==='view-form'){await api('/api/jobs/view',{method:'POST',body:{user_ids:[...selected],delay:Number(data.get('delay'))}});selected.clear();dialog.close();page='jobs';await sync();toast('Просмотр поставлен в очередь.');}
+ }catch(err){if(errEl&&errEl.isConnected)errEl.textContent=err.message;else toast(err.message);}
+ finally{if(submit.isConnected){submit.disabled=false;submit.innerHTML=original;}}
+});
+let bootRetries=0;
+function waking(){
+ app.innerHTML=`<div class='boot'><span class='brand-mark'>л</span><p style='max-width:300px;text-align:center;line-height:1.8'>Бесплатный сервер просыпается и восстанавливает данные. Это может занять около минуты.</p>${bootRetries>=30?button('retry-boot','Попробовать ещё раз','light'):''}</div>`;
+ if(bootRetries++<30)setTimeout(boot,2500);
+}
+async function boot(){
+ try{
+  const response=await fetch('/health',{headers:{Accept:'application/json'}});
+  if(response.status===503){waking();return;}
+  const h=response.ok?await response.json():{};
+  server=h.service==='story-cloud'&&h.ok;
+  if(server&&h.ready===false){waking();return;}
+ }catch{waking();return;}
+ if(server){
+  try{const d=await api('/api/auth/me');csrf=d.csrf;authenticated=true;state=await api('/api/state');}
+  catch(err){authenticated=false;if(err.status===503){waking();return;}}
+ }
+ render();if(server&&!authenticated)showLogin();
+ setInterval(async()=>{if(!server||!authenticated||polling||document.visibilityState!=='visible'||dialog.open||document.activeElement?.matches('input,select'))return;polling=true;try{await sync(page!=='account');}catch(err){toast(err.message);}finally{polling=false;}},5000);
+}
+boot();

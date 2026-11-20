@@ -1,0 +1,34 @@
+# Free, ephemeral compute. Checkpoints are encrypted in the private Site's R2 storage.
+# No paid disk or 30-day database is provisioned.
+services:
+  - type: web
+    name: story-cloud-free
+    runtime: python
+    plan: free
+    region: frankfurt
+    numInstances: 1
+    buildCommand: pip install -r story-cloud/requirements.txt
+    startCommand: uvicorn --app-dir story-cloud app.main:create_app --factory --host 0.0.0.0 --port $PORT --workers 1 --no-access-log
+    healthCheckPath: /health
+    autoDeployTrigger: 'off'
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: DATA_DIR
+        value: /tmp/story-cloud
+      - key: FREE_MODE
+        value: 'true'
+      - key: ADMIN_PASSWORD
+        generateValue: true
+      - key: APP_ENCRYPTION_SECRET
+        generateValue: true
+      - key: COOKIE_SECURE
+        value: 'true'
+      - key: PUBLIC_ORIGIN
+        sync: false
+      - key: STORY_BRIDGE_SECRET
+        sync: false
+      - key: SNAPSHOT_SITE_URL
+        sync: false
+      - key: SNAPSHOT_SITE_TOKEN
+        sync: false

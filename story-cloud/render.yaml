@@ -1,0 +1,25 @@
+# Always-on deployment. Applying this Blueprint creates a paid service and disk.
+services:
+  - type: web
+    name: story-cloud-gosposin
+    runtime: docker
+    plan: 0.5c-512mb
+    region: frankfurt
+    numInstances: 1
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    disk:
+      name: story-cloud-data
+      mountPath: /var/data/story-cloud
+      sizeGB: 1
+    envVars:
+      - key: DATA_DIR
+        value: /var/data/story-cloud
+      - key: COOKIE_SECURE
+        value: 'true'
+      - key: APP_ENCRYPTION_SECRET
+        generateValue: true
+      - key: ADMIN_PASSWORD
+        sync: false

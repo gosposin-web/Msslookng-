@@ -1,0 +1,9 @@
+.git
+.openai
+.env*
+data
+dist
+tests
+__pycache__
+.pytest_cache
+*.zip

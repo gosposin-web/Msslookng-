@@ -1,0 +1,1 @@
+{"name":"story-cloud","private":true,"scripts":{"build":"python build_cloud.py","check":"node --check app/static/app.js","test:gateway":"node --test tests/worker.test.mjs"}}

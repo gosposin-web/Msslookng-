@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+data/
+*.session*
+*.zip
+__pycache__/
+.pytest_cache/
+pytest-of-*/
+*.sqlite3*
+.venv/
+.openai/local*
+
