@@ -50,6 +50,7 @@ class FakeGateway:
 
     async def import_tdata(self,folder,api_id,api_hash,passcode,password):
         assert (folder/'key_datas').exists()
+        self.import_api=(api_id,api_hash)
         self.import_path=folder
         self.db.execute('INSERT INTO account VALUES(1,?,?,?,?,?)',
                          ('90000','Аккаунт','test_account',self.cipher.encrypt(b'secret-session'),now()))
@@ -362,3 +363,42 @@ def test_private_site_bridge_requires_secret_identity_and_csrf(setup):
     assert client.post('/api/sources',json={'ref':'@test_group'}).status_code==403
     client.headers['X-CSRF-Token']=response.json()['csrf']
     assert client.post('/api/sources',json={'ref':'@test_group'}).status_code==200
+
+
+def test_tdata_import_uses_published_defaults_without_api_fields(setup):
+    from opentele.api import API
+    client,db,gateway,_,config=setup
+    login(client)
+    assert client.get('/health').json()['api_mode']=='public'
+    state=client.get('/api/state').json()
+    assert state['telegram_api_mode']=='public'
+    assert state['telegram_api_configured'] is True
+    data=make_zip({'tdata/key_datas':b'key','tdata/D877F783D5D3EF8Cs':b'account'})
+    response=client.post('/api/account/tdata',files={'file':('tdata.zip',data,'application/zip')})
+    assert response.status_code==200,response.text
+    assert gateway.import_api==(API.TelegramDesktop.api_id,API.TelegramDesktop.api_hash)
+    assert API.TelegramDesktop.api_hash not in client.get('/api/state').text
+
+
+@pytest.mark.parametrize('partial',[{'api_id':'12345'},{'api_hash':'a'*32}])
+def test_partial_api_override_does_not_mix_with_published_defaults(setup,partial):
+    client,db,gateway,_,config=setup
+    login(client)
+    data=make_zip({'tdata/key_datas':b'key'})
+    result=client.post('/api/account/tdata',files={'file':('tdata.zip',data)},data=partial)
+    assert result.status_code==400
+    assert db.account() is None
+
+
+def test_own_api_pair_takes_priority_and_public_mode_can_be_disabled(setup):
+    from app.telegram import api_credentials, TelegramError
+    *_,config=setup
+    assert api_credentials(config,12345,'a'*32)==(12345,'a'*32)
+    config.telegram_api_id=45678
+    config.telegram_api_hash='b'*32
+    assert api_credentials(config)==(45678,'b'*32)
+    config.telegram_api_id=0
+    config.telegram_api_hash=''
+    config.public_api_defaults=False
+    with pytest.raises(TelegramError):
+        api_credentials(config)

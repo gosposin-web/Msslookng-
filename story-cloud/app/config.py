@@ -20,6 +20,7 @@ class Config:
     snapshot_site_url: str = ''
     snapshot_site_token: str = ''
     free_mode: bool = False
+    public_api_defaults: bool = True
 
     @classmethod
     def from_env(cls):
@@ -35,6 +36,7 @@ class Config:
             snapshot_site_url=os.getenv('SNAPSHOT_SITE_URL', '').rstrip('/'),
             snapshot_site_token=os.getenv('SNAPSHOT_SITE_TOKEN', ''),
             free_mode=os.getenv('FREE_MODE','false').lower()=='true',
+            public_api_defaults=os.getenv('TELEGRAM_USE_PUBLIC_API','true').lower()=='true',
         )
         cfg.validate()
         return cfg

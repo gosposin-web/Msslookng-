@@ -17,6 +17,22 @@ class TelegramError(ValueError):
     pass
 
 
+def api_credentials(config,api_id=0,api_hash=''):
+    """Resolve complete pairs atomically; never mix a custom ID with a public hash."""
+    if api_id or api_hash:
+        if not api_id or not api_hash:
+            raise TelegramError('Укажите оба параметра: API ID и API Hash, либо оставьте оба поля пустыми.')
+    elif config.telegram_api_id or config.telegram_api_hash:
+        api_id,api_hash=config.telegram_api_id,config.telegram_api_hash
+    elif config.public_api_defaults:
+        # Published application parameters from the dependency, not account credentials.
+        from opentele.api import API
+        api_id,api_hash=API.TelegramDesktop.api_id,API.TelegramDesktop.api_hash
+    if api_id<=0 or not re.fullmatch(r'[a-fA-F0-9]{32}',api_hash):
+        raise TelegramError('Введите корректные API ID и API Hash своего приложения с my.telegram.org.')
+    return api_id,api_hash
+
+
 async def authorize_cloud(desktop_client, cloud_client, password):
     qr = await cloud_client.qr_login()
     # QRLogin.wait must be running before the Desktop session accepts the token.
@@ -59,6 +75,8 @@ def normalize_chat(value: str) -> str:
 
 def friendly_error(exc: Exception) -> str:
     name = type(exc).__name__
+    if name in {'ApiIdPublishedFloodError','ApiIdInvalidError'}:
+        return 'Telegram отклонил параметры приложения. Укажите свои API ID и API Hash в дополнительных настройках подключения.'
     if name in {'ChatAdminRequiredError','ChatAdminRequired'}:
         return 'Telegram не открыл список участников. Нужны права администратора; можно выбрать сбор авторов сообщений.'
     if name in {'ChannelPrivateError','UserNotParticipantError','InviteHashExpiredError','InviteHashInvalidError'}:

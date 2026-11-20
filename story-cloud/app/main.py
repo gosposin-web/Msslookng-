@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from .archive import ArchiveError, MAX_UPLOAD, extract_tdata
 from .config import Config
 from .db import DB, now
-from .telegram import TelegramError, TelegramGateway, friendly_error, normalize_chat
+from .telegram import TelegramError, TelegramGateway, friendly_error, normalize_chat, api_credentials
 from .worker import VIEW_LIMIT_24H, Worker
 from .snapshot import SnapshotStore, SnapshotError
 
@@ -181,7 +181,8 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
 
     @app.get('/health')
     def health():
-        return {'ok':True,'service':'story-cloud','ready':not storage or storage.ready,'mode':'free' if config.free_mode else 'standard'}
+        return {'ok':True,'service':'story-cloud','ready':not storage or storage.ready,'mode':'free' if config.free_mode else 'standard',
+                'api_mode':'custom' if config.telegram_api_id and config.telegram_api_hash else 'public' if config.public_api_defaults else 'required'}
 
     @app.post('/api/auth/login')
     def login(body: LoginInput, request: Request, response: Response):
@@ -228,7 +229,8 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                 'sources':sources,'jobs':jobs,'events':db.all('SELECT * FROM events ORDER BY id DESC LIMIT 50'),
                 'stats':{'people':len(people),'active':active,'views_24h':db.one('SELECT COUNT(*) n FROM views WHERE viewed_at>?',(now()-86400,))['n']},
                 'view_limit_24h':VIEW_LIMIT_24H,'cooldown_until':cooldown['value'] if cooldown else 0,
-                'telegram_api_configured':bool(config.telegram_api_id and config.telegram_api_hash),
+                'telegram_api_configured':bool(config.telegram_api_id and config.telegram_api_hash) or config.public_api_defaults,
+                'telegram_api_mode':'custom' if config.telegram_api_id and config.telegram_api_hash else 'public' if config.public_api_defaults else 'required',
                 'auth_mode':'chatgpt' if config.bridge_secret else 'password',
                 'free_mode':config.free_mode,'storage_error':storage.error if storage else ''}
 
@@ -240,10 +242,10 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
             raise HTTPException(409,'Сначала отключите текущий аккаунт.')
         if gateway.lock.locked():
             raise HTTPException(409,'Другое действие ещё выполняется. Попробуйте позже.')
-        api_id=api_id or config.telegram_api_id
-        api_hash=api_hash or config.telegram_api_hash
-        if api_id<=0 or not re.fullmatch(r'[a-fA-F0-9]{32}',api_hash):
-            raise HTTPException(400,'Введите API ID и API Hash своего приложения с my.telegram.org.')
+        try:
+            api_id,api_hash=api_credentials(config,api_id,api_hash)
+        except TelegramError as exc:
+            raise HTTPException(400,str(exc)) from None
         if len(passcode)>512 or len(password)>512:
             raise HTTPException(400,'Слишком длинный пароль.')
         try:
