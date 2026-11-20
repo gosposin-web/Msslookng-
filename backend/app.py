@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from cryptography.fernet import Fernet
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Path as ApiPath, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, SecretStr
@@ -169,6 +169,7 @@ def account_summary(item: dict) -> dict:
 def create_app(settings: Settings | None = None, transport=None) -> FastAPI:
     pending: dict[str, Attempt] = {}
     cooldowns: dict[str, float] = {}
+    story_cooldowns: dict[tuple[str, str], float] = {}
     mutation = asyncio.Lock()
 
     async def clear_expired():
@@ -179,9 +180,10 @@ def create_app(settings: Settings | None = None, transport=None) -> FastAPI:
                 for owner, attempt in list(pending.items()):
                     if attempt.expires <= now:
                         pending.pop(owner)
-                for owner, expires in list(cooldowns.items()):
-                    if expires <= now:
-                        cooldowns.pop(owner)
+                for deadlines in (cooldowns, story_cooldowns):
+                    for key, expires in list(deadlines.items()):
+                        if expires <= now:
+                            deadlines.pop(key)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -210,6 +212,7 @@ def create_app(settings: Settings | None = None, transport=None) -> FastAPI:
                     await cleanup
                 pending.clear()
                 cooldowns.clear()
+                story_cooldowns.clear()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -289,6 +292,28 @@ def create_app(settings: Settings | None = None, transport=None) -> FastAPI:
             "accounts": [account_summary(item) for item in accounts],
             "proxies": [proxy_summary(item) for item in proxies],
         }
+
+    @app.get("/api/telegram/accounts/{account_id}/stories")
+    async def story_feed(
+        account_id: str = ApiPath(pattern=r"^[0-9]{1,24}$"),
+        owner: str = Depends(owner_identity),
+    ):
+        client = telegram_client()
+        key = (owner, account_id)
+        async with mutation:
+            account = await app.state.store.get(owner, "account", account_id)
+            if account is None:
+                raise HTTPException(404, "Аккаунт не найден.")
+            remaining = math.ceil(story_cooldowns.get(key, 0) - time.monotonic())
+            if remaining > 0:
+                raise TelegramProblem("rate_limit", remaining)
+            proxy = await load_proxy(owner, account["proxy_id"])
+            try:
+                return await client.active_stories(account["session"], proxy)
+            except TelegramProblem as error:
+                if error.retry_after:
+                    story_cooldowns[key] = time.monotonic() + error.retry_after
+                raise
 
     @app.post("/api/telegram/proxies", status_code=201)
     async def add_proxy(body: ProxyInput, owner: str = Depends(owner_identity)):

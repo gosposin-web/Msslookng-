@@ -14,7 +14,7 @@
       <span class="brand-icon" aria-hidden="true"><span></span></span>
       <span>Панель сторис</span>
     </div>
-    <a class="button quiet" href="/demo#stories">Масслукинг · демо</a>
+    <a class="button quiet" href="#story-feed">Сторис</a>
   </header>
   <main>
     <div class="page-heading">
@@ -41,6 +41,30 @@
         <div id="saved-proxies" aria-live="polite"><p class="empty">Загружаем прокси…</p></div>
       </section>
     </div>
+    <section class="card story-feed" id="story-feed" aria-labelledby="story-feed-title">
+      <div class="section-heading">
+        <h2 id="story-feed-title">Сторис Telegram</h2>
+        <button class="button primary" id="load-stories" type="button" disabled>Загрузить ленту</button>
+      </div>
+      <div class="story-settings">
+        <label class="field">
+          <span>Аккаунт</span>
+          <select id="story-account" disabled></select>
+        </label>
+        <label class="field">
+          <span>Фильтр по файлу</span>
+          <input id="story-file" type="file" accept=".txt,.csv,text/plain,text/csv" aria-describedby="story-file-help">
+        </label>
+      </div>
+      <p class="muted small" id="story-file-help">TXT или CSV со списком @username или ссылками t.me на профили и каналы.</p>
+      <div class="button-row story-actions">
+        <p class="muted small" id="story-filter-status" aria-live="polite" hidden></p>
+        <button class="button quiet" id="clear-story-filter" type="button" hidden>Сбросить фильтр</button>
+      </div>
+      <p class="form-error" id="story-error" role="alert" hidden></p>
+      <p class="muted small" id="story-status" aria-live="polite">Загружаем список аккаунтов…</p>
+      <div id="story-results"></div>
+    </section>
   </main>
 
   <dialog class="modal" id="login-dialog" aria-labelledby="login-title">

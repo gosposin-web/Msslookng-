@@ -4,6 +4,7 @@ const ownerId = /^[A-Za-z0-9_-]{1,160}$/;
 const itemId = /^[A-Za-z0-9_-]{1,64}$/;
 const routes = [
   ["GET", /^\/api\/telegram$/],
+  ["GET", /^\/api\/telegram\/accounts\/[0-9]{1,24}\/stories$/],
   ["POST", /^\/api\/telegram\/(?:proxies|login)$/],
   ["POST", /^\/api\/telegram\/login\/[a-z0-9_-]{1,64}\/(?:code|password)$/i],
   ["DELETE", /^\/api\/telegram\/(?:accounts|proxies|login)\/[a-z0-9_-]{1,64}$/i]

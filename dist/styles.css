@@ -226,6 +226,10 @@ main:focus { outline: none; }
 .button:disabled { cursor: default; opacity: .48; }
 .button-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .connection-status:has(> :not([hidden])) { margin-bottom: 12px; }
+.story-feed { margin-top: 14px; scroll-margin-top: 14px; }
+.story-settings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 8px; }
+.story-actions { margin-block: 8px; }
+.story-feed .result-row { margin-top: 8px; }
 
 .account-summary {
   position: relative;
@@ -402,6 +406,7 @@ progress::-moz-progress-bar { background: var(--primary); }
 }
 
 @media (max-width: 660px) {
+  .story-settings { grid-template-columns: 1fr; }
   .sidebar {
     inset: auto 0 0;
     width: auto;

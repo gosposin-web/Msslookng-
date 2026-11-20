@@ -23,6 +23,12 @@ let loginBusy = false;
 let proxyBusy = false;
 let listRevision = 0;
 let toastTimer;
+let storyReady = false;
+let storyLoading = false;
+let storyRevision = 0;
+let storyFilterRevision = 0;
+let storyFeed = null;
+let storyFilter = new Set();
 
 function message(id, text = "") {
   const element = byId(id);
@@ -96,6 +102,133 @@ function renderLists() {
   if (proxies.length === 0) proxyList.append(line("p", "empty", "Можно использовать прямое подключение или добавить прокси."));
 }
 
+function updateStoryControls() {
+  const select = byId("story-account");
+  select.disabled = !storyReady || !accounts.length || storyLoading;
+  const button = byId("load-stories");
+  button.disabled = !storyReady || !select.value || storyLoading;
+  button.textContent = storyLoading ? "Загружаем…" : storyFeed ? "Обновить ленту" : "Загрузить ленту";
+}
+
+function renderStoryFeed() {
+  const results = byId("story-results");
+  results.replaceChildren();
+  let status = "Выбери аккаунт и загрузи ленту.";
+  if (!storyReady || !accounts.length) status = "Подключи аккаунт Telegram, чтобы загрузить ленту.";
+  if (storyLoading) status = "Запрашиваем активные сторис в Telegram…";
+  if (storyFeed) {
+    const matches = storyFeed.profiles.filter(profile =>
+      storyFilter.size === 0 || profile.usernames.some(username => storyFilter.has(username))
+    );
+    const count = matches.reduce((total, profile) => total + profile.story_ids.length, 0);
+    status = `Профилей ${matches.length} · Сторис ${count}`;
+    if (!storyFeed.complete) status += " · Лента загружена частично";
+    for (const profile of matches) {
+      const row = line("div", "result-row", "");
+      const title = line("div", "", "");
+      const username = profile.usernames[0];
+      const description = [username && `@${username}`, `Сторис ${profile.story_ids.length}`].filter(Boolean).join(" · ");
+      title.append(line("div", "participant-name", profile.name), line("div", "participant-chat", description));
+      row.append(title);
+      const firstStory = profile.story_ids[0];
+      if (/^[a-z0-9_]{1,32}$/i.test(username ?? "") && Number.isSafeInteger(firstStory) && firstStory > 0) {
+        const link = line("a", "button secondary", "Открыть");
+        link.href = `https://t.me/${username}/s/${firstStory}`;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.setAttribute("aria-label", `Открыть сторис ${profile.name} в Telegram`);
+        row.append(link);
+      }
+      results.append(row);
+    }
+  }
+  message("story-status", status);
+  updateStoryControls();
+}
+
+function resetStoryFeed() {
+  storyRevision++;
+  storyLoading = false;
+  storyFeed = null;
+  message("story-error");
+  renderStoryFeed();
+}
+
+function renderStoryAccounts(ready) {
+  const select = byId("story-account");
+  const previous = select.value;
+  storyReady = ready;
+  select.replaceChildren(...(ready ? accounts : []).map(account => {
+    const name = [account.first_name, account.last_name].filter(Boolean).join(" ") || "Аккаунт Telegram";
+    const handle = account.username ? ` · @${account.username}` : "";
+    return new Option(name + handle, account.id);
+  }));
+  if (ready && accounts.some(account => account.id === previous)) select.value = previous;
+  if (select.value !== previous || !ready) resetStoryFeed();
+  else renderStoryFeed();
+}
+
+function parseStoryFilter(text) {
+  const usernames = new Set();
+  let skipped = 0;
+  const headings = new Set(["username", "usernames", "profile", "channel", "url", "ссылка", "профиль", "канал"]);
+  for (const raw of text.split(/[\r\n,;\t]+/)) {
+    const entry = raw.trim().replace(/^"(.*)"$/, "$1").trim();
+    if (!entry || headings.has(entry.toLowerCase())) continue;
+    const name = entry.match(/^(?:https?:\/\/)?(?:t\.me|telegram\.me)\/([a-z0-9_]{1,32})\/?(?:\?[^\s]*)?$/i)?.[1] ?? entry.replace(/^@/, "");
+    if (/^[a-z0-9_]{1,32}$/i.test(name)) usernames.add(name.toLowerCase());
+    else skipped++;
+  }
+  return { usernames, skipped };
+}
+
+async function loadStoryFilter(event) {
+  const revision = ++storyFilterRevision;
+  const file = event.target.files[0];
+  if (!file) return;
+  let parsed;
+  try {
+    if (!/\.(txt|csv)$/i.test(file.name) || file.size > 128 * 1024) {
+      throw new Error("Выбери TXT или CSV размером до 128 КБ.");
+    }
+    parsed = parseStoryFilter(await file.text());
+    if (!parsed.usernames.size) throw new Error("В файле должны быть @username или ссылки t.me на профили.");
+  } catch (error) {
+    if (revision === storyFilterRevision) message("story-error", error.message);
+    return;
+  }
+  if (revision !== storyFilterRevision) return;
+  storyFilter = parsed.usernames;
+  const skipped = parsed.skipped ? ` · Пропущено ${parsed.skipped}` : "";
+  message("story-filter-status", `Профилей в фильтре ${storyFilter.size}${skipped}`);
+  byId("clear-story-filter").hidden = false;
+  message("story-error");
+  renderStoryFeed();
+}
+
+async function loadStoryFeed() {
+  const id = byId("story-account").value;
+  if (!storyReady || !id || storyLoading) return;
+  const revision = ++storyRevision;
+  storyLoading = true;
+  storyFeed = null;
+  message("story-error");
+  renderStoryFeed();
+  try {
+    const response = await request(`/accounts/${encodeURIComponent(id)}/stories`);
+    if (revision !== storyRevision) return;
+    if (!Array.isArray(response?.profiles)) throw new Error("Telegram не вернул ленту сторис.");
+    storyFeed = response;
+  } catch (error) {
+    if (revision === storyRevision) message("story-error", error.message);
+  } finally {
+    if (revision === storyRevision) {
+      storyLoading = false;
+      renderStoryFeed();
+    }
+  }
+}
+
 async function loadLists() {
   const revision = ++listRevision;
   byId("retry-telegram").disabled = true;
@@ -107,6 +240,7 @@ async function loadLists() {
     proxies = result.proxies;
     renderLists();
     const ready = result.telegram_ready === true;
+    renderStoryAccounts(ready);
     byId("connect-account").disabled = !ready;
     byId("add-proxy").disabled = !ready;
     byId("retry-telegram").hidden = ready;
@@ -117,6 +251,7 @@ async function loadLists() {
     byId("add-proxy").disabled = true;
     byId("connected-accounts").replaceChildren();
     byId("saved-proxies").replaceChildren();
+    renderStoryAccounts(false);
     byId("retry-telegram").hidden = false;
     message("telegram-error", error.message);
   } finally {
@@ -253,5 +388,17 @@ byId("cancel-proxy").addEventListener("click", () => proxyDialog.close());
 proxyDialog.addEventListener("cancel", event => { if (proxyBusy) event.preventDefault(); });
 proxyDialog.addEventListener("close", () => byId("proxy-form").reset());
 byId("retry-telegram").addEventListener("click", loadLists);
+byId("story-account").addEventListener("change", resetStoryFeed);
+byId("story-file").addEventListener("change", loadStoryFilter);
+byId("load-stories").addEventListener("click", loadStoryFeed);
+byId("clear-story-filter").addEventListener("click", () => {
+  storyFilterRevision++;
+  storyFilter.clear();
+  byId("story-file").value = "";
+  byId("clear-story-filter").hidden = true;
+  message("story-error");
+  message("story-filter-status");
+  renderStoryFeed();
+});
 
 loadLists();

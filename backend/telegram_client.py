@@ -6,6 +6,7 @@ import re
 import socket
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Literal
 
 
@@ -164,3 +165,61 @@ class TelegramClient:
         async with self._connection(session, proxy) as client:
             if not await client.log_out():
                 raise TelegramProblem("telegram_rejected")
+
+    async def active_stories(self, session: str, proxy: Proxy | None) -> dict:
+        from telethon import functions, types, utils
+
+        entities = {}
+        by_peer: dict[int, set[int]] = {}
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        complete = False
+        loaded_page = False
+        now = datetime.now(timezone.utc)
+        async with self._connection(session, proxy) as client:
+            try:
+                async with asyncio.timeout(17):
+                    while True:
+                        page = await client(functions.stories.GetAllStoriesRequest(
+                            next=True if cursor is not None else None, state=cursor
+                        ))
+                        if not isinstance(page, types.stories.AllStories):
+                            raise TelegramProblem("telegram_rejected")
+                        loaded_page = True
+                        for entity in (*page.users, *page.chats):
+                            entities[utils.get_peer_id(entity)] = entity
+                        for peer in page.peer_stories:
+                            active = {
+                                story.id for story in peer.stories
+                                if isinstance(story, (types.StoryItem, types.StoryItemSkipped))
+                                and story.expire_date and story.expire_date > now
+                            }
+                            if active:
+                                by_peer.setdefault(utils.get_peer_id(peer.peer), set()).update(active)
+                        if not page.has_more:
+                            complete = True
+                            break
+                        cursor = page.state
+                        if not cursor or cursor in seen_cursors:
+                            break
+                        seen_cursors.add(cursor)
+            except TimeoutError:
+                if not loaded_page:
+                    raise
+
+        profiles = []
+        for peer_id, story_ids in by_peer.items():
+            entity = entities.get(peer_id)
+            names = [getattr(entity, attr, None) for attr in ("first_name", "last_name")]
+            title = getattr(entity, "title", None) or " ".join(filter(None, names))
+            usernames = [getattr(entity, "username", None)]
+            usernames.extend(alias.username for alias in getattr(entity, "usernames", None) or () if alias.active)
+            public_names = list(dict.fromkeys(
+                name.lower() for name in usernames if name and re.fullmatch(r"[A-Za-z0-9_]{1,32}", name)
+            ))
+            profiles.append({
+                "name": title or ("@" + public_names[0] if public_names else "Профиль Telegram"),
+                "usernames": public_names,
+                "story_ids": sorted(story_ids),
+            })
+        return {"profiles": profiles, "complete": complete}
