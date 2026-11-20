@@ -38,13 +38,25 @@ def extract_tdata(archive: Path, destination: Path) -> Path:
             copied = 0
             for item in entries:
                 p = PurePosixPath(item.filename.replace('\\', '/'))
-                if item.is_dir() or p.parent != root:
+                if item.is_dir():
                     continue
-                # Desktop account data and local key files. No downloads/caches are retained.
-                if not (re.fullmatch(r'key_data[s01]', p.name)
-                        or re.fullmatch(r'[A-Fa-f0-9]{16}[s01]', p.name)):
+                try:
+                    relative=p.relative_to(root)
+                except ValueError:
                     continue
-                with z.open(item) as src, open(destination / p.name, 'xb') as dst:
+                top_level=(len(relative.parts)==1 and (
+                    re.fullmatch(r'key_data[s01]',p.name)
+                    or re.fullmatch(r'[A-Fa-f0-9]{16}[s01]',p.name)))
+                account_map=(len(relative.parts)==2
+                    and re.fullmatch(r'[A-Fa-f0-9]{16}',relative.parts[0])
+                    and re.fullmatch(r'(?:map|config)[s01]',relative.parts[1]))
+                if not (top_level or account_map):
+                    continue
+                # opentele needs the account's map before it reads the root authorization.
+                # Keep only authentication/map/config files, never media caches.
+                target=destination.joinpath(*relative.parts)
+                target.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+                with z.open(item) as src, open(target, 'xb') as dst:
                     total = 0
                     while chunk := src.read(64 * 1024):
                         total += len(chunk)
@@ -52,7 +64,7 @@ def extract_tdata(archive: Path, destination: Path) -> Path:
                         if total > MAX_UNPACKED or copied > MAX_UNPACKED:
                             raise ArchiveError('Распакованный архив превышает лимит.')
                         dst.write(chunk)
-                (destination / p.name).chmod(0o600)
+                target.chmod(0o600)
             return destination
     except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
         raise ArchiveError('Не удалось прочитать ZIP-архив tdata.') from exc
