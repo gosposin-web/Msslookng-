@@ -305,3 +305,58 @@ async def test_failed_new_cloud_validation_revokes_only_the_new_session(tmp_path
     assert cloud_client.logged_out and cloud_client.disconnected
     assert desktop_client.disconnected and not desktop_client.logged_out
     assert db.account() is None
+
+
+@pytest.mark.asyncio
+async def test_numeric_chat_id_uses_only_visible_dialogs_and_caches_result(panel):
+    from datetime import datetime,timezone
+    from types import SimpleNamespace
+    client,app,protocol=panel
+    entity=types.Channel(id=12345,title='Synthetic group',photo=types.ChatPhotoEmpty(),
+                         date=datetime.now(timezone.utc),megagroup=True,access_hash=42)
+    calls=[]
+    async def get_entity(ref):
+        calls.append('entity')
+        raise ValueError('No cached access hash')
+    async def dialogs(limit):
+        assert limit==1000
+        calls.append('dialogs')
+        yield SimpleNamespace(id=-1000000012345,entity=entity)
+    protocol.get_entity=get_entity;protocol.iter_dialogs=dialogs
+    assert await app.state.gateway.resolve('-1000000012345') is entity
+    assert await app.state.gateway.resolve('-1000000012345') is entity
+    assert calls==['entity','dialogs']
+    await app.state.gateway.close()
+    assert app.state.gateway.entity_cache=={}
+
+
+@pytest.mark.asyncio
+async def test_failed_connection_is_cleaned_even_if_disconnect_fails(panel,monkeypatch):
+    import json
+    import app.telegram as telegram
+    client,app,protocol=panel
+    gateway=app.state.gateway
+    await gateway.close()
+    credential=gateway.cipher.encrypt(json.dumps({'session':'','api_id':123456,'api_hash':'a'*32}).encode())
+    app.state.db.execute('UPDATE account SET credential=?',(credential,))
+    class Broken(ProtocolClient):
+        async def connect(self):
+            raise ConnectionError('synthetic connection failure')
+        async def disconnect(self):
+            self.disconnected=True
+            raise RuntimeError('synthetic close failure')
+    broken=Broken()
+    monkeypatch.setattr(telegram,'TelegramClient',lambda *a,**kw:broken)
+    with pytest.raises(ConnectionError):
+        await gateway.client_for_account()
+    assert broken.disconnected and gateway.client is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('exc',[errors.InputUserDeactivatedError(None),errors.UserNotMutualContactError(None)])
+async def test_unavailable_target_user_does_not_fail_the_whole_chat(panel,exc):
+    import json
+    _,app,protocol=panel
+    protocol.fail=exc
+    person={'peer':app.state.gateway.cipher.encrypt(json.dumps({'id':123456,'hash':42}).encode())}
+    assert await app.state.gateway.stories(person)==[]

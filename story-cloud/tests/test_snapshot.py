@@ -10,6 +10,8 @@ from app.db import DB, now
 from app.snapshot import SnapshotError, SnapshotStore
 from app.worker import Worker
 from test_app import FakeGateway, account, source, tick
+from app.chat_files import parse_chat_file
+from app.source_store import import_sources
 
 
 class Remote:
@@ -162,6 +164,8 @@ async def test_restore_of_old_checkpoint_migrates_profile_schema(tmp_path):
     store.ready=True
     account(db,c)
     db.execute('DROP TABLE account_profile')
+    db.execute('DROP TABLE source_import_jobs')
+    db.execute('DROP TABLE source_imports')
     await store.flush()
     await store.close()
     c2=config(tmp_path/'new')
@@ -172,4 +176,57 @@ async def test_restore_of_old_checkpoint_migrates_profile_schema(tmp_path):
     assert db2.public_account()['profile_loaded'] is False
     db2.execute('INSERT INTO account_profile(id,first_name,last_name,updated_at) VALUES(1,?,?,?)',('Имя','',now()))
     assert db2.public_account()['first_name']=='Имя'
+    assert db2.all('SELECT * FROM source_imports')==[]
     await restored.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_file_queue_and_retry_identity_survive_total_local_disk_loss(tmp_path):
+    remote=Remote();transport=httpx.MockTransport(remote)
+    c=config(tmp_path/'first');db=DB(c.data_dir/'state.sqlite3')
+    store=SnapshotStore(db,c,transport=transport)
+    assert await store.acquire();store.ready=True
+    account(db,c)
+    data=b'@group_one\n@group_two\n@group_three'
+    parsed=parse_chat_file(data,'chats.txt');key='a'*32
+    result=import_sources(db,parsed,data,'members',2,True,key)
+    assert result['queued']==3
+    db.claim()
+    await store.flush();await store.close()
+    c2=config(tmp_path/'after-sleep');db2=DB(c2.data_dir/'state.sqlite3')
+    restored=SnapshotStore(db2,c2,transport=transport)
+    assert await restored.acquire();await restored.restore()
+    assert restored.restore_generation==1
+    db2.recover()
+    assert db2.one("SELECT COUNT(*) n FROM jobs WHERE status='queued'")['n']==3
+    assert import_sources(db2,parsed,data,'members',2,True,key)['replayed']
+    assert db2.one('SELECT COUNT(*) n FROM jobs')['n']==3
+    assert db2.one('SELECT COUNT(*) n FROM source_import_jobs')['n']==3
+    await restored.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_malformed_lease_response_is_retryable(tmp_path):
+    c=config(tmp_path/'lease');db=DB(c.data_dir/'state.sqlite3')
+    store=SnapshotStore(db,c,transport=httpx.MockTransport(lambda request:httpx.Response(200,content=b'invalid json')))
+    with pytest.raises(SnapshotError):
+        await store.acquire()
+    assert store.deadline==0
+    await store.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_save_without_etag_is_not_reported_as_durable(tmp_path):
+    remote=Remote()
+    def transport(request):
+        response=remote(request)
+        if request.method=='PUT':
+            response.headers.pop('etag',None)
+        return response
+    c=config(tmp_path/'etag');db=DB(c.data_dir/'state.sqlite3')
+    store=SnapshotStore(db,c,transport=httpx.MockTransport(transport))
+    assert await store.acquire();store.ready=True
+    with pytest.raises(SnapshotError):
+        await store.flush()
+    assert store.saved<store.revision
+    await store.client.aclose()

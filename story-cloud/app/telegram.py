@@ -68,9 +68,15 @@ async def authorize_cloud(desktop_client, cloud_client, password):
 
 def normalize_chat(value: str) -> str:
     value = value.strip()
+    if value.startswith(('t.me/','telegram.me/')):
+        value='https://'+value
     if value.startswith(('http://','https://')):
-        p = urlparse(value)
-        if p.hostname not in ('t.me','telegram.me') or p.query or p.fragment:
+        try:
+            p = urlparse(value)
+            valid=p.hostname in ('t.me','telegram.me') and not p.query and not p.fragment and not p.username and not p.password and p.port in (None,443,80)
+        except ValueError:
+            valid=False
+        if not valid:
             raise TelegramError('Укажите ссылку t.me на группу или её @username.')
         value = p.path.strip('/')
     if value.startswith('+') and re.fullmatch(r'\+[A-Za-z0-9_-]{8,80}', value):
@@ -82,7 +88,7 @@ def normalize_chat(value: str) -> str:
     value = value.lstrip('@')
     if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{3,31}', value):
         raise TelegramError('Укажите @username группы, ссылку t.me или ID доступного чата.')
-    return '@' + value
+    return '@' + value.lower()
 
 
 def friendly_error(exc: Exception) -> str:
@@ -126,11 +132,14 @@ class TelegramGateway:
         self.cipher = cipher
         self.lock = asyncio.Lock()
         self.client = None
+        self.entity_cache = {}
 
     async def close(self):
-        if self.client:
-            await self.client.disconnect()
-            self.client = None
+        client,self.client=self.client,None
+        self.entity_cache.clear()
+        if client:
+            with suppress(Exception):
+                await asyncio.wait_for(client.disconnect(),timeout=5)
 
     async def client_for_account(self):
         if self.client and self.client.is_connected():
@@ -142,8 +151,8 @@ class TelegramGateway:
         self.client = create_cloud_client(
             StringSession(d['session']), d['api_id'], d['api_hash'],
             receive_updates=False)
-        await self.client.connect()
         try:
+            await self.client.connect()
             await inspect_account(self.client)
         except BaseException:
             await self.close()
@@ -209,10 +218,10 @@ class TelegramGateway:
         finally:
             if client:
                 with suppress(Exception):
-                    await client.disconnect()
+                    await asyncio.wait_for(client.disconnect(),timeout=5)
             if desktop_client:
                 with suppress(Exception):
-                    await desktop_client.disconnect()
+                    await asyncio.wait_for(desktop_client.disconnect(),timeout=5)
 
     def cache_profile(self, me, photo=None, *, replace_photo=False, photo_id=None):
         if str(me.id) != self.db.account()['user_id']:
@@ -278,15 +287,32 @@ class TelegramGateway:
 
     async def resolve(self, ref):
         client = await self.client_for_account()
+        cached=self.entity_cache.get(ref)
+        if cached and cached[0]>now()-300:
+            return cached[1]
         if ref.startswith('+'):
             invite = await client(functions.messages.CheckChatInviteRequest(ref[1:]))
             if not isinstance(invite, types.ChatInviteAlready):
                 raise TelegramError('Аккаунт ещё не состоит в этой группе. Вступите в неё вручную.')
             entity = invite.chat
         else:
-            entity = await client.get_entity(int(ref) if ref.startswith('-') else ref)
+            try:
+                entity = await client.get_entity(int(ref) if ref.startswith('-') else ref)
+            except (ValueError,errors.ChannelInvalidError,errors.PeerIdInvalidError):
+                if not ref.startswith('-'):
+                    raise
+                # StringSession does not persist entity access hashes. Populate the
+                # normal dialog cache only from chats already visible to this account.
+                entity=None
+                async for dialog in client.iter_dialogs(limit=1000):
+                    if dialog.id==int(ref):
+                        entity=dialog.entity
+                        break
+                if entity is None:
+                    raise TelegramError('Чат по ID не найден среди доступных диалогов. Укажите его @username или ссылку t.me.')
         if not isinstance(entity,(types.Chat,types.Channel)) or (isinstance(entity,types.Channel) and not entity.megagroup):
             raise TelegramError('Нужна группа или супергруппа. Список подписчиков канала обычно недоступен.')
+        self.entity_cache[ref]=(now(),entity)
         return entity
 
     def person(self, user):
@@ -330,7 +356,7 @@ class TelegramGateway:
         try:
             result = await client(functions.stories.GetPeerStoriesRequest(self.peer(person)))
         except Exception as exc:
-            if type(exc).__name__ in {'UserPrivacyRestrictedError','UserIsBlockedError','UserIdInvalidError','PeerIdInvalidError'}:
+            if type(exc).__name__ in {'UserPrivacyRestrictedError','UserIsBlockedError','UserIdInvalidError','PeerIdInvalidError','InputUserDeactivatedError','UserNotMutualContactError'}:
                 return []
             raise
         stories = []

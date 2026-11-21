@@ -159,6 +159,14 @@ def test_archive_symlink_and_multiple_accounts_roots(tmp_path):
         extract_tdata(archive,tmp_path)
 
 
+def test_archive_accepts_windows_path_separators(tmp_path):
+    archive=tmp_path/'windows.zip'
+    archive.write_bytes(make_zip({'tdata\\key_datas':b'key','tdata\\D877F783D5D3EF8Cs':b'account'}))
+    target=tmp_path/'out';target.mkdir()
+    extract_tdata(archive,target)
+    assert (target/'key_datas').read_bytes()==b'key'
+
+
 def test_import_erases_archive_and_hides_credentials(setup):
     client,db,gateway,_,config=setup
     login(client)
@@ -227,7 +235,8 @@ async def test_flood_wait_blocks_other_jobs_and_survives_pause(setup):
     job=db.job(jid)
     assert job['status']=='waiting'
     assert job['next_run']>=now()+119
-    other=db.create_job('scan',{'phase':'gather'},'source')
+    db.execute('INSERT INTO sources VALUES(?,?,?,?,?,?)',('other-source','@other_group','Другая группа','members',300,now()))
+    other=db.create_job('scan',{'phase':'gather'},'other-source')
     assert db.claim() is None
     assert client.post(f'/api/jobs/{jid}/control',json={'action':'pause'}).status_code==200
     assert client.post(f'/api/jobs/{jid}/control',json={'action':'resume'}).status_code==200

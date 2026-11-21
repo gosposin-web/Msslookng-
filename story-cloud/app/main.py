@@ -26,6 +26,8 @@ from .snapshot import SnapshotStore, SnapshotError
 from .account_access import AccountAccessError, account_error
 from .avatar import MAX_PHOTO_UPLOAD, prepare_avatar
 from .diagnostics import import_diagnostic
+from .chat_files import MAX_CHAT_FILE, ChatFileError, parse_chat_file
+from .source_store import SourceStoreError, add_source as store_source, import_sources, control_import, start_scan
 
 STATIC = Path(__file__).parent / 'static'
 COOKIE = 'story_cloud_session'
@@ -39,6 +41,7 @@ class BodyLimitMiddleware:
         if scope['type']!='http':
             return await self.app(scope,receive,send)
         limit = (MAX_UPLOAD+128*1024 if scope['path']=='/api/account/tdata' else
+                 MAX_CHAT_FILE+64*1024 if scope['path']=='/api/sources/import' else
                  MAX_PHOTO_UPLOAD+64*1024 if scope['path']=='/api/account/profile/photo' else 128*1024)
         headers=dict(scope.get('headers',[]))
         try:
@@ -227,19 +230,28 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
 
     @app.get('/api/state')
     def state(login=Depends(authenticated)):
-        people=db.all('SELECT stories FROM people')
-        active=sum(any(s['expires']>now() for s in json.loads(p['stories'])) for p in people)
-        sources=db.all('''SELECT s.*,(SELECT COUNT(*) FROM source_people sp WHERE sp.source_id=s.id) AS collected
-                          FROM sources s ORDER BY created_at DESC''')
+        counts=db.one("SELECT COUNT(*) people,COALESCE(SUM(EXISTS(SELECT 1 FROM json_each(p.stories) s WHERE json_extract(s.value,'$.expires')>?)),0) active FROM people p",(now(),))
+        sources=db.all('''SELECT s.*,(SELECT COUNT(*) FROM source_people sp WHERE sp.source_id=s.id) AS collected,
+                          j.status scan_status,j.message scan_message,j.id scan_id
+                          FROM sources s LEFT JOIN jobs j ON j.id=(SELECT id FROM jobs WHERE source_id=s.id AND kind='scan' ORDER BY created_at DESC,rowid DESC LIMIT 1)
+                          ORDER BY s.created_at DESC,s.rowid DESC''')
         jobs=[]
-        for row in db.all('SELECT * FROM jobs ORDER BY created_at DESC,rowid DESC LIMIT 50'):
+        for row in db.all("SELECT * FROM jobs ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'waiting' THEN 1 WHEN 'queued' THEN 2 WHEN 'paused' THEN 3 ELSE 4 END,created_at DESC,rowid DESC LIMIT 600"):
             p=json.loads(row['payload'])
             jobs.append(db.public_job(row)|{'total':len(p.get('user_ids',[])) if row['kind']=='view' else row['collected'],
                                            'phase':p.get('phase','gather')})
         cooldown=db.one("SELECT value FROM runtime WHERE key='telegram_wait_until'")
+        job_counts={r['status']:r['n'] for r in db.all('SELECT status,COUNT(*) n FROM jobs GROUP BY status')}
+        imports=db.all('''SELECT i.id,i.created_at,COUNT(j.id) total,
+                           SUM(j.status='queued') queued,SUM(j.status='running') running,
+                           SUM(j.status='waiting') waiting,SUM(j.status='paused') paused,
+                           SUM(j.status='done') done,SUM(j.status='failed') failed,SUM(j.status='cancelled') cancelled
+                           FROM source_imports i JOIN source_import_jobs ij ON ij.import_id=i.id
+                           JOIN jobs j ON j.id=ij.job_id GROUP BY i.id ORDER BY i.created_at DESC,i.rowid DESC LIMIT 5''')
         return {'account':db.public_account(),
                 'sources':sources,'jobs':jobs,'events':db.all('SELECT * FROM events ORDER BY id DESC LIMIT 50'),
-                'stats':{'people':len(people),'active':active,'views_24h':db.one('SELECT COUNT(*) n FROM views WHERE viewed_at>?',(now()-86400,))['n']},
+                'job_counts':job_counts,'job_total':sum(job_counts.values()),'source_imports':imports,
+                'stats':{'people':counts['people'],'active':counts['active'],'views_24h':db.one('SELECT COUNT(*) n FROM views WHERE viewed_at>?',(now()-86400,))['n']},
                 'view_limit_24h':VIEW_LIMIT_24H,'cooldown_until':cooldown['value'] if cooldown else 0,
                 'telegram_api_configured':bool(config.telegram_api_id and config.telegram_api_hash) or config.public_api_defaults,
                 'telegram_api_mode':'custom' if config.telegram_api_id and config.telegram_api_hash else 'public' if config.public_api_defaults else 'required',
@@ -396,6 +408,7 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                 c.execute('DELETE FROM views')
                 c.execute('DELETE FROM view_attempts')
                 c.execute('DELETE FROM runtime')
+                c.execute('DELETE FROM source_imports')
             db.event('Аккаунт отключён. Локальные данные сессии и аудитории удалены.')
         return {'ok':True,'revoked':revoked,'message':('Облачная сессия завершена.' if revoked else 'Данные удалены. Завершите сессию Story Cloud в настройках Telegram, если она осталась активной.')}
 
@@ -407,13 +420,38 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
             raise HTTPException(400,str(exc)) from None
         if body.mode not in ('members','authors'):
             raise HTTPException(400,'Выберите участников или авторов сообщений.')
-        if db.one('SELECT id FROM sources WHERE ref=? COLLATE NOCASE',(ref,)):
-            raise HTTPException(409,'Этот чат уже добавлен.')
-        if db.one('SELECT COUNT(*) n FROM sources')['n']>=50:
-            raise HTTPException(400,'Максимум 50 источников.')
-        source_id=uuid.uuid4().hex
-        db.execute('INSERT INTO sources VALUES(?,?,?,?,?,?)',(source_id,ref,ref,body.mode,body.max_users,now()))
-        return {'id':source_id}
+        try:
+            return {'id':store_source(db,ref,body.mode,body.max_users)}
+        except SourceStoreError as exc:
+            raise HTTPException(exc.status,str(exc)) from None
+
+    @app.post('/api/sources/import')
+    async def import_chats(file: UploadFile=File(...),mode: str=Form('members'),
+                           max_users: int=Form(300),start_scans: bool=Form(True),request_id: str=Form(''),
+                           login=Depends(authenticated)):
+        try:
+            if mode not in ('members','authors') or not 1<=max_users<=5000:
+                raise HTTPException(400,'Выберите режим сбора и лимит от 1 до 5000 человек на каждый чат.')
+            data=await file.read(MAX_CHAT_FILE+1)
+            parsed=await asyncio.to_thread(parse_chat_file,data,file.filename or '')
+            if storage:
+                await storage.flush()
+            return import_sources(db,parsed,data,mode,max_users,start_scans,request_id or uuid.uuid4().hex)
+        except ChatFileError as exc:
+            raise HTTPException(400,str(exc)) from None
+        except SourceStoreError as exc:
+            raise HTTPException(exc.status,str(exc)) from None
+        except SnapshotError as exc:
+            raise HTTPException(503,str(exc)) from None
+        finally:
+            await file.close()
+
+    @app.post('/api/source-imports/{import_id}/control')
+    def control_chat_import(import_id: str,body: ControlInput,login=Depends(authenticated)):
+        try:
+            return {'ok':True,'changed':control_import(db,import_id,body.action)}
+        except SourceStoreError as exc:
+            raise HTTPException(exc.status,str(exc)) from None
 
     @app.delete('/api/sources/{source_id}')
     def delete_source(source_id: str,login=Depends(authenticated)):
@@ -424,12 +462,10 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
 
     @app.post('/api/sources/{source_id}/scan')
     def scan(source_id: str,login=Depends(authenticated)):
-        need_account()
-        if not db.one('SELECT id FROM sources WHERE id=?',(source_id,)):
-            raise HTTPException(404,'Чат не найден.')
-        if db.one("SELECT id FROM jobs WHERE source_id=? AND status IN ('queued','running','waiting','paused')",(source_id,)):
-            raise HTTPException(409,'Для этого чата уже есть незавершённое задание.')
-        return {'id':db.create_job('scan',{'phase':'gather','cursor':0},source_id)}
+        try:
+            return {'id':start_scan(db,source_id)}
+        except SourceStoreError as exc:
+            raise HTTPException(exc.status,str(exc)) from None
 
     def people_query(search='',source='',active=False):
         sql='SELECT DISTINCT p.* FROM people p'
@@ -481,42 +517,55 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
 
     @app.post('/api/jobs/view')
     def view(body: ViewInput,login=Depends(authenticated)):
-        need_account()
-        if db.one("SELECT id FROM jobs WHERE kind='view' AND status IN ('queued','running','waiting','paused')"):
-            raise HTTPException(409,'Сначала завершите или остановите текущее задание просмотра.')
         ids=list(dict.fromkeys(body.user_ids))
         if not all(re.fullmatch(r'[0-9]{1,20}',uid) for uid in ids):
             raise HTTPException(400,'Неверный список пользователей.')
-        selected=[]
-        for uid in ids:
-            person=db.one('SELECT * FROM people WHERE user_id=?',(uid,))
-            if person and db.public_person(person)['stories_count']:
-                selected.append(uid)
-        if not selected:
-            raise HTTPException(400,'У выбранных пользователей сейчас нет проверенных активных историй.')
-        return {'id':db.create_job('view',{'user_ids':selected,'position':0,'delay':body.delay})}
+        with db.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            if not c.execute('SELECT id FROM account WHERE id=1').fetchone():
+                raise HTTPException(409,'Сначала подключите аккаунт.')
+            if c.execute("SELECT id FROM jobs WHERE kind='view' AND status IN ('queued','running','waiting','paused')").fetchone():
+                raise HTTPException(409,'Сначала завершите или остановите текущее задание просмотра.')
+            selected=[]
+            for uid in ids:
+                person=c.execute('SELECT * FROM people WHERE user_id=?',(uid,)).fetchone()
+                if person and db.public_person(dict(person))['stories_count']:
+                    selected.append(uid)
+            if not selected:
+                raise HTTPException(400,'У выбранных пользователей сейчас нет проверенных активных историй.')
+            job_id=uuid.uuid4().hex
+            c.execute("INSERT INTO jobs(id,kind,status,payload,created_at,updated_at) VALUES(?,'view','queued',?,?,?)",
+                      (job_id,json.dumps({'user_ids':selected,'position':0,'delay':body.delay}),now(),now()))
+            c.execute('INSERT INTO events(job_id,level,message,created_at) VALUES(?,?,?,?)',(job_id,'info','Задание добавлено в очередь.',now()))
+            return {'id':job_id}
 
     @app.post('/api/jobs/{job_id}/control')
     def control(job_id: str,body: ControlInput,login=Depends(authenticated)):
-        job=db.job(job_id)
-        if not job:
-            raise HTTPException(404,'Задание не найдено.')
-        action=body.action
-        if action=='pause' and job['status'] in ('queued','running','waiting'):
-            db.update_job(job_id,status='paused',message='Приостановлено пользователем.')
-        elif action=='cancel' and job['status'] in ('queued','running','waiting','paused','failed'):
-            db.update_job(job_id,status='cancelled',message='Остановлено пользователем.')
-        elif action=='resume' and job['status'] in ('paused','failed'):
-            need_account()
-            payload=job['payload']
-            if payload.get('uncertain'):
-                payload['position']=payload.get('position',0)+1
-                payload.pop('uncertain')
-                db.event('Истории с неподтверждённым результатом пропущены при продолжении.',job_id,'warning')
-            db.update_job(job_id,status='waiting' if job['next_run']>now() else 'queued',
-                           payload=payload,message='Задание продолжено.',retries=0)
-        else:
-            raise HTTPException(409,'Состояние задания уже изменилось. Обновите страницу.')
+        with db.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            job=c.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
+            if not job:
+                raise HTTPException(404,'Задание не найдено.')
+            action=body.action
+            if action=='pause' and job['status'] in ('queued','running','waiting'):
+                c.execute("UPDATE jobs SET status='paused',message='Приостановлено пользователем.',updated_at=? WHERE id=?",(now(),job_id))
+            elif action=='cancel' and job['status'] in ('queued','running','waiting','paused','failed'):
+                c.execute("UPDATE jobs SET status='cancelled',message='Остановлено пользователем.',updated_at=? WHERE id=?",(now(),job_id))
+            elif action=='resume' and job['status'] in ('paused','failed'):
+                if not c.execute('SELECT id FROM account WHERE id=1').fetchone():
+                    raise HTTPException(409,'Сначала подключите аккаунт.')
+                if job['kind']=='scan' and c.execute("SELECT id FROM jobs WHERE source_id=? AND id<>? AND kind='scan' AND status IN ('queued','running','waiting','paused')",(job['source_id'],job_id)).fetchone():
+                    raise HTTPException(409,'Для этого чата уже есть другой незавершённый сбор.')
+                payload=json.loads(job['payload'])
+                if payload.get('uncertain'):
+                    payload['position']=payload.get('position',0)+1
+                    payload.pop('uncertain')
+                    c.execute('INSERT INTO events(job_id,level,message,created_at) VALUES(?,?,?,?)',
+                              (job_id,'warning','Истории с неподтверждённым результатом пропущены при продолжении.',now()))
+                c.execute('UPDATE jobs SET status=?,payload=?,message=?,retries=0,updated_at=? WHERE id=?',
+                          ('waiting' if job['next_run']>now() else 'queued',json.dumps(payload),'Задание продолжено.',now(),job_id))
+            else:
+                raise HTTPException(409,'Состояние задания уже изменилось. Обновите страницу.')
         return {'ok':True}
 
     app.mount('/assets',StaticFiles(directory=STATIC),name='assets')

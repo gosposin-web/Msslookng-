@@ -31,7 +31,7 @@ def extract_tdata(archive: Path, destination: Path) -> Path:
                     raise ArchiveError('Снимите пароль с ZIP. Код-пароль tdata вводится отдельно.')
             roots = {str(PurePosixPath(e.filename.replace('\\', '/')).parent)
                      for e in entries
-                     if re.fullmatch(r'key_data[s01]', PurePosixPath(e.filename).name)}
+                     if re.fullmatch(r'key_data[s01]', PurePosixPath(e.filename.replace('\\','/')).name)}
             if len(roots) != 1:
                 raise ArchiveError('Нужен один каталог tdata с файлом key_datas (или key_data0/1).')
             root = PurePosixPath(roots.pop())

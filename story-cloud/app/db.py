@@ -68,6 +68,17 @@ class DB:
                 CREATE TABLE IF NOT EXISTS login_failures (
                     ip TEXT NOT NULL, created_at INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS runtime (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS source_imports (
+                    id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL, created_at INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS source_import_jobs (
+                    import_id TEXT NOT NULL REFERENCES source_imports(id) ON DELETE CASCADE,
+                    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                    PRIMARY KEY(import_id,job_id));
+                CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(status,next_run,created_at);
+                CREATE INDEX IF NOT EXISTS jobs_source_created ON jobs(source_id,created_at);
+                CREATE INDEX IF NOT EXISTS job_people_unchecked ON job_people(job_id,checked,user_id);
+                CREATE INDEX IF NOT EXISTS views_recent ON views(account_id,viewed_at);
+                CREATE INDEX IF NOT EXISTS view_attempts_recent ON view_attempts(account_id,created_at);
             ''')
 
     @contextmanager
@@ -152,7 +163,7 @@ class DB:
             wait = c.execute("SELECT value FROM runtime WHERE key='telegram_wait_until'").fetchone()
             if wait and wait['value']>now():
                 return None
-            row = c.execute("SELECT id FROM jobs WHERE status IN ('queued','waiting') AND next_run<=? ORDER BY created_at,id LIMIT 1", (now(),)).fetchone()
+            row = c.execute("SELECT id FROM jobs WHERE status IN ('queued','waiting') AND next_run<=? ORDER BY created_at,rowid LIMIT 1", (now(),)).fetchone()
             if not row:
                 return None
             c.execute("UPDATE jobs SET status='running',updated_at=? WHERE id=?", (now(),row['id']))
@@ -178,12 +189,20 @@ class DB:
             'stories_count':len(stories), 'expires_at':max((s['expires'] for s in stories),default=None)}
 
     def save_person(self, person, source_id, job_id):
+        return self.save_people([person],source_id,job_id)
+
+    def save_people(self, people, source_id, job_id, limit=None):
         with self.connect() as c:
-            c.execute('''INSERT INTO people(user_id,name,username,peer,created_at) VALUES(?,?,?,?,?)
+            count=c.execute('SELECT COUNT(*) n FROM job_people WHERE job_id=?',(job_id,)).fetchone()['n']
+            for person in people:
+                if limit is not None and count>=limit:
+                    break
+                c.execute('''INSERT INTO people(user_id,name,username,peer,created_at) VALUES(?,?,?,?,?)
                          ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,username=excluded.username,peer=excluded.peer''',
                       (person['user_id'],person['name'],person.get('username'),person['peer'],now()))
-            c.execute('INSERT OR IGNORE INTO source_people VALUES(?,?)', (source_id,person['user_id']))
-            c.execute('INSERT OR IGNORE INTO job_people(job_id,user_id) VALUES(?,?)', (job_id,person['user_id']))
+                c.execute('INSERT OR IGNORE INTO source_people VALUES(?,?)', (source_id,person['user_id']))
+                count+=c.execute('INSERT OR IGNORE INTO job_people(job_id,user_id) VALUES(?,?)', (job_id,person['user_id'])).rowcount
+            return count
 
     def viewed_ids(self, account_id, user_id):
         return {r['story_id'] for r in self.all('''SELECT story_id FROM views WHERE account_id=? AND user_id=?

@@ -1,6 +1,7 @@
 """Encrypted, conditional cloud checkpoints for an ephemeral free server."""
 import asyncio
 import os
+import logging
 import secrets
 import sqlite3
 import tempfile
@@ -33,6 +34,7 @@ class SnapshotStore:
         self.error=''
         self.lock=asyncio.Lock()
         self.deadline=0
+        self.restore_generation=0
         self.db.on_change=self.changed
 
     def changed(self):
@@ -51,7 +53,13 @@ class SnapshotStore:
             return False
         if response.status_code!=200:
             raise SnapshotError('Не удалось открыть облачное хранилище.')
-        self.deadline=int(response.json()['expires'])
+        try:
+            deadline=int(response.json()['expires'])
+            if deadline<=time.time()+5:
+                raise ValueError('Expired lease')
+        except (ValueError,TypeError,KeyError,OverflowError):
+            raise SnapshotError('Хранилище вернуло некорректный срок блокировки. Повторяем подключение.') from None
+        self.deadline=deadline
         return True
 
     def _snapshot(self):
@@ -74,9 +82,12 @@ class SnapshotStore:
         response=await self._request('GET','/internal/snapshot')
         if response.status_code==404:
             self.etag=None
+            self.restore_generation+=1
             return
         if response.status_code!=200 or len(response.content)>16*1024*1024:
             raise SnapshotError('Не удалось прочитать облачное сохранение.')
+        if not response.headers.get('etag'):
+            raise SnapshotError('Хранилище не передало версию сохранения. Восстановление приостановлено.')
         try:
             encrypted=response.content
             compressed=self.cipher.decrypt(encrypted)
@@ -100,6 +111,7 @@ class SnapshotStore:
                     source.close()
             self.db.initialize_schema()
             self.etag=response.headers['etag']
+            self.restore_generation+=1
         except Exception:
             raise SnapshotError('Сохранение не расшифровано. Проверьте постоянный ключ сервера.') from None
 
@@ -119,6 +131,8 @@ class SnapshotStore:
                 raise SnapshotError('Сохранение занято другим экземпляром сервера. Задания приостановлены.')
             if response.status_code!=200:
                 raise SnapshotError('Облачное сохранение не подтверждено. Новые просмотры приостановлены.')
+            if not response.headers.get('etag'):
+                raise SnapshotError('Хранилище не подтвердило версию сохранения. Повторяем запись.')
             self.etag=response.headers['etag']
             self.saved=revision
             self.error=''
@@ -140,7 +154,8 @@ class SnapshotStore:
                     if not await self.acquire():
                         self.ready=False
                         if on_lost:
-                            await on_lost()
+                            with suppress(Exception):
+                                await on_lost()
                         continue
                     renewed=time.time()
                 await self.flush()
@@ -151,6 +166,14 @@ class SnapshotStore:
                 if self.deadline<=time.time()+10:
                     self.ready=False
                     if on_lost:
+                        with suppress(Exception):
+                            await on_lost()
+            except Exception as exc:
+                logging.getLogger('story_cloud.storage').error('snapshot_cycle_failed exception=%s',type(exc).__name__)
+                self.error='Облачное сохранение временно недоступно. Повторяем подключение.'
+                self.ready=False
+                if on_lost:
+                    with suppress(Exception):
                         await on_lost()
             await asyncio.sleep(2)
 

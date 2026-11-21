@@ -2,6 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {readFile} from 'node:fs/promises';
+import {webcrypto} from 'node:crypto';
 
 const source=await readFile(new URL('../app/static/app.js',import.meta.url),'utf8');
 const healthy={ok:true,service:'story-cloud',ready:true};
@@ -18,7 +19,7 @@ async function harness(responder){
  const document={querySelector:selector=>elements[selector]||null,querySelectorAll:()=>[],visibilityState:'visible',activeElement:null,
   addEventListener(type,handler){(handlers[type]??=[]).push(handler);}};
  class ClockDate extends Date{static now(){return clock;}}
- const context=vm.createContext({console,document,window:{scrollTo(){}},Date:ClockDate,Intl,Set,URLSearchParams,FormData,AbortController,
+ const context=vm.createContext({console,document,window:{scrollTo(){}},Date:ClockDate,Intl,Set,URLSearchParams,FormData,AbortController,crypto:webcrypto,
   fetch:async(path,options)=>{requests.push({path,options});return responder(path,requests.length,options);},
   setTimeout(fn,delay){const next=++id;timers.set(next,{fn,delay});return next;},clearTimeout(key){timers.delete(key);},
   setInterval(fn,delay){const next=++id;intervals.set(next,{fn,delay});return next;},clearInterval(key){intervals.delete(key);}});
@@ -27,6 +28,7 @@ async function harness(responder){
  return {elements,timers,intervals,requests,context,
   async retry(){const entry=[...timers.entries()].find(([,t])=>t.delay!==6500);assert(entry,'Expected a scheduled retry');const [key,timer]=entry;timers.delete(key);clock+=timer.delay;await timer.fn();await settle();},
   async clickRetry(){const target={dataset:{action:'retry-boot'},disabled:false,isConnected:true};for(const handler of handlers.click||[])await handler({target:{closest:()=>target},preventDefault(){}});await settle();},
+  async clickAction(action){const target={dataset:{action},disabled:false,isConnected:true};for(const handler of handlers.click||[])await handler({target:{closest:()=>target},preventDefault(){}});await settle();},
   advance(ms){clock+=ms;},
   async poll(){assert.equal(intervals.size,1);await [...intervals.values()][0].fn();},
  };
@@ -119,4 +121,36 @@ test('A background 429 pauses reads rather than polling every five seconds',asyn
  await h.poll();const count=h.requests.length;
  h.advance(5000);await h.poll();assert.equal(h.requests.length,count);
  h.advance(85000);await h.poll();assert.equal(h.requests.length,count+1);
+});
+
+test('File import form supports phone files and preconfiguration before account login',async()=>{
+ const h=await harness(normal);
+ await h.clickAction('import-chats');
+ const html=h.elements['#dialog'].innerHTML;
+ assert.match(html,/TXT или CSV, до 200/);
+ assert.match(html,/accept='.txt,.csv,text\/plain,text\/csv'/);
+ assert.match(html,/name='start_scans' disabled/);
+ assert.match(html,/name='request_id' value='[a-f0-9-]{36}'/);
+});
+
+test('Import results escape invalid file rows and describe partial success',async()=>{
+ const h=await harness(normal);
+ vm.runInContext(`importResult({added:2,existing:1,queued:2,busy:1,duplicates:3,invalid_count:1,invalid_rows:[{line:5,value:'<img src=x onerror=alert(1)>',message:'Неверная запись'}],replayed:false})`,h.context);
+ const html=h.elements['#dialog'].innerHTML;
+ assert.match(html,/Новых чатов: 2/);assert.match(html,/Неверных записей: 1/);
+ assert.match(html,/&lt;img/);assert.doesNotMatch(html,/<img src=x/);
+ assert.match(html,/Открыть очередь/);
+});
+
+test('A 200-chat queue is summarized and additional jobs can be shown',async()=>{
+ const jobs=Array.from({length:200},(_,i)=>({id:String(i),kind:'scan',status:'queued',created_at:1800000000,source_id:null,total:0,collected:0,checked:0,found:0,phase:'gather'}));
+ const data={...emptyState,jobs,job_counts:{queued:200},source_imports:[{id:'test-batch',created_at:1800000000,total:200,queued:200}]};
+ const h=await harness(path=>path==='/api/state'?json(data):normal(path));
+ vm.runInContext("page='jobs';render()",h.context);
+ let html=h.elements['#app'].innerHTML;
+ assert.match(html,/Сбор из файла · 200 чатов/);
+ assert.match(html,/Пауза всего импорта/);
+ assert.equal((html.match(/class='job-card'/g)||[]).length,40);
+ await h.clickAction('more-jobs');html=h.elements['#app'].innerHTML;
+ assert.equal((html.match(/class='job-card'/g)||[]).length,80);
 });
