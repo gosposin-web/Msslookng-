@@ -44,9 +44,11 @@ async function api(path,options={}){
  const headers={Accept:'application/json',...options.headers};
  if(options.method&&options.method!=='GET')headers['X-CSRF-Token']=csrf;
  if(options.body&&!(options.body instanceof FormData)){headers['Content-Type']='application/json';options.body=JSON.stringify(options.body);}
- const response=await fetch(path,{...options,headers,credentials:'same-origin'});
- let data;try{data=await response.json();}catch{throw new Error('Сервер не ответил. Повторите позже.');}
- if(!response.ok){if(response.status===401&&server&&path!=='/api/auth/login'){authenticated=false;showLogin();}const error=new Error(Array.isArray(data.detail)?'Проверьте значения полей.':data.detail||'Не удалось выполнить действие.');Object.assign(error,{status:response.status,code:data.code,hint:data.hint,appealUrl:data.appeal_url,freezeUntil:data.freeze_until});throw error;}
+ const {authPrompt=true,...requestOptions}=options;
+ const response=await fetch(path,{...requestOptions,headers,credentials:'same-origin'});
+ let data;try{data=await response.json();}catch{const error=new Error(response.status===429?'Сервер попросил подождать.':'Сервер не вернул ожидаемый ответ. Повторите позже.');Object.assign(error,{status:response.status,retryAfter:retryDelay(response,30000)});throw error;}
+ if(!data||typeof data!=='object')throw new Error('Сервер не вернул ожидаемый ответ. Повторите позже.');
+ if(!response.ok){if(response.status===401&&server&&path!=='/api/auth/login'&&authPrompt){authenticated=false;showLogin();}const error=new Error(Array.isArray(data.detail)?'Проверьте значения полей.':data.detail||'Не удалось выполнить действие.');Object.assign(error,{status:response.status,code:data.code,hint:data.hint,appealUrl:data.appeal_url,freezeUntil:data.freeze_until,retryAfter:retryDelay(response,30000)});throw error;}
  return data;
 }
 function nav(mobile=false){return Object.entries(labels).map(([key,label])=>`<button type='button' class='${mobile?'':'nav-btn '}${page===key?'active':''}' data-tab='${key}' ${page===key?"aria-current='page'":''}>${icon(navIcons[key])}<span>${label}</span>${!mobile&&key==='audience'&&state.stats.people?`<span class='nav-count'>${number(state.stats.people)}</span>`:''}</button>`).join('');}
@@ -135,7 +137,7 @@ document.addEventListener('click',async e=>{
  const action=target.dataset.action,id=target.dataset.id;
  try{
   if(action==='close-dialog'){if(dialog.dataset.login!=='true')dialog.close();return;}
-  if(action==='retry-boot'){bootRetries=0;await boot();return;}
+  if(action==='retry-boot'){if(Date.now()<bootRetryAt){toast('Следующая проверка будет доступна через '+Math.ceil((bootRetryAt-Date.now())/1000)+' сек.');return;}bootRetries=0;await boot();return;}
   if(action==='add-source'){addSource();return;}
   if(action.startsWith('go-')){await go(action.slice(3));return;}
   if(action==='help'||action==='launch-info'){showDialog(dialogTitle(server?'Как это работает':'Запуск облачной панели')+(server?`<ol class='help-list'><li>Подключите свой аккаунт через ZIP с tdata.</li><li>Добавьте чат и нажмите «Собрать».</li><li>Во вкладке «Аудитория» выберите найденных людей с историями.</li><li>Запустите просмотр и проверяйте задания. Страницу можно закрыть.</li></ol>`:`<p>Интерфейс уже доступен с телефона. Для подключения tdata и работы заданий нужен постоянно работающий сервер с сохранением данных.</p><div class='notice'>${icon('cloud')}<span>Сервер ещё не подключён. Поэтому импорт и запуск заданий сейчас недоступны. После размещения сервер выдаст отдельную ссылку на рабочую панель.</span></div>`)+`<div class='dialog-actions'>${button('close-dialog','Понятно','primary')}</div>`);return;}
@@ -199,24 +201,69 @@ document.addEventListener('submit',async e=>{
  }catch(err){if(errEl&&errEl.isConnected)showError(errEl,err);else toast(err.message);}
  finally{if(submit.isConnected){submit.disabled=false;submit.innerHTML=original;}}
 });
-let bootRetries=0;
-function waking(){
- app.innerHTML=`<div class='boot'><span class='brand-mark'>л</span><p style='max-width:300px;text-align:center;line-height:1.8'>Бесплатный сервер просыпается и восстанавливает данные. Это может занять около минуты.</p>${bootRetries>=30?button('retry-boot','Попробовать ещё раз','light'):''}</div>`;
- if(bootRetries++<30)setTimeout(boot,2500);
+let bootRetries=0,bootTimer=null,booting=false,bootRetryAt=0,pollTimer=null,pollRetryAt=0;
+function retryDelay(response,fallback){
+ const value=response.headers.get('Retry-After');
+ if(value===null||!value.trim())return fallback;
+ const seconds=Number(value);
+ const delay=Number.isFinite(seconds)?Math.ceil(seconds*1000):Date.parse(value)-Date.now();
+ return Number.isFinite(delay)&&delay>0?Math.max(1000,delay):fallback;
+}
+function connectionIssue(status,delay){
+ clearTimeout(bootTimer);bootTimer=null;
+ const signIn=status===401||status===403,limited=status===429,waking=status==='waking'||status===503;
+ const heading=signIn?'Нужно войти в панель':limited?'Сервер попросил подождать':waking?'Подключаемся к серверу':'Не удалось связаться с сервером';
+ const message=signIn?'Откройте личную панель через вход с ChatGPT.':limited?'Сервер временно ограничил частоту запросов. Это не ошибка вашего tdata.':waking?'Бесплатный сервер может просыпаться или восстанавливать данные. Подключение может занять около минуты.':'Рабочий сервер пока не подтвердил соединение. Проверьте интернет или повторите попытку позже.';
+ const attempt=++bootRetries,automatic=!signIn&&attempt<12;
+ const wait=signIn?0:delay??Math.min(30000,3000*2**Math.floor((attempt-1)/3));
+ bootRetryAt=Date.now()+wait;
+ app.innerHTML=`<div class='boot connection-state' data-connection-state='${signIn?'signin':limited?'limited':waking?'waking':'unavailable'}'><span class='brand-mark'>л</span><h1>${heading}</h1><p>${message}</p>${automatic?`<p class='connection-retry' role='status'>Повторим проверку через ${Math.ceil(wait/1000)} сек.</p>`:signIn?'':`<p class='connection-retry'>Автоматические попытки приостановлены. Повторите проверку вручную.</p>`}${signIn?`<a class='btn primary' href='/signin-with-chatgpt?return_to=%2F' target='_top'>Войти через ChatGPT</a>`:button('retry-boot','Повторить проверку','light')}</div>`;
+ if(automatic){
+  const resume=()=>{const remaining=bootRetryAt-Date.now();if(remaining>0){bootTimer=setTimeout(resume,Math.min(remaining,2147483647));return;}bootTimer=null;void boot();};
+  bootTimer=setTimeout(resume,Math.min(wait,2147483647));
+ }
+}
+function startPolling(){
+ if(pollTimer!==null)return;
+ pollTimer=setInterval(async()=>{
+  if(!server||!authenticated||polling||Date.now()<pollRetryAt||document.visibilityState!=='visible'||dialog.open||document.activeElement?.matches('input,select'))return;
+  polling=true;
+  try{await sync(page!=='account');}
+  catch(err){if(err.status===429){pollRetryAt=Date.now()+err.retryAfter;toast('Сервер запросил паузу. Обновление данных повторится позже.');}else toast(err.message);}
+  finally{polling=false;}
+ },5000);
 }
 async function boot(){
+ if(booting||Date.now()<bootRetryAt)return;
+ clearTimeout(bootTimer);bootTimer=null;booting=true;
+ app.innerHTML=`<div class='boot'><span class='brand-mark'>л</span><p>Подключаемся к рабочему серверу…</p></div>`;
  try{
-  const response=await fetch('/health',{headers:{Accept:'application/json'}});
-  if(response.status===503){waking();return;}
-  const h=response.ok?await response.json():{};
-  server=h.service==='story-cloud'&&h.ok;
-  if(server&&h.ready===false){waking();return;}
- }catch{waking();return;}
- if(server){
-  try{const d=await api('/api/auth/me');csrf=d.csrf;authenticated=true;state=await api('/api/state');}
-  catch(err){authenticated=false;if(err.status===503){waking();return;}}
- }
- render();if(server&&!authenticated)showLogin();
- setInterval(async()=>{if(!server||!authenticated||polling||document.visibilityState!=='visible'||dialog.open||document.activeElement?.matches('input,select'))return;polling=true;try{await sync(page!=='account');}catch(err){toast(err.message);}finally{polling=false;}},5000);
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),65000);
+  let response,h;
+  try{
+   response=await fetch('/health',{headers:{Accept:'application/json'},credentials:'same-origin',cache:'no-store',signal:controller.signal});
+   if(!response.ok){connectionIssue(response.status,retryDelay(response,response.status===429?30000:5000));return;}
+   h=await response.json();
+  }finally{clearTimeout(timeout);}
+  // Preview is an explicit server mode, never a fallback for HTTP or network errors.
+  if(h?.service==='story-preview'){server=false;authenticated=false;bootRetries=0;bootRetryAt=0;render();return;}
+  if(h?.service!=='story-cloud'||h.ok!==true){connectionIssue('invalid');return;}
+  server=true;
+  if(h.ready===false){connectionIssue('waking');return;}
+  try{
+   const d=await api('/api/auth/me',{authPrompt:false});
+   csrf=d.csrf;
+   const nextState=await api('/api/state',{authPrompt:false});
+   state=nextState;authenticated=true;
+  }catch(err){
+   authenticated=false;
+   if(err.status===401){render();showLogin();startPolling();return;}
+   connectionIssue(err.status||0,err.status===429?err.retryAfter:undefined);return;
+  }
+  bootRetries=0;bootRetryAt=0;pollRetryAt=0;
+  render();startPolling();
+ }catch{connectionIssue(0);}
+ finally{booting=false;}
 }
 boot();

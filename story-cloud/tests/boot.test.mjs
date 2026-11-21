@@ -1,0 +1,122 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import {readFile} from 'node:fs/promises';
+
+const source=await readFile(new URL('../app/static/app.js',import.meta.url),'utf8');
+const healthy={ok:true,service:'story-cloud',ready:true};
+const emptyState={account:null,sources:[],jobs:[],events:[],stats:{people:0,active:0,views_24h:0},view_limit_24h:200};
+const json=(data,status=200,headers={})=>Response.json(data,{status,headers});
+
+// Run the actual browser script with a small DOM boundary and a controllable clock.
+// No Telegram calls, browser installation, or live credentials are involved.
+async function harness(responder){
+ let clock=Date.now(),id=0;
+ const timers=new Map(),intervals=new Map(),handlers={},requests=[];
+ const el=()=>({innerHTML:'',textContent:'',dataset:{},open:false,classList:{add(){},remove(){}},addEventListener(){},showModal(){this.open=true;},close(){this.open=false;}});
+ const elements={'#app':el(),'#dialog':el(),'#toast':el()};
+ const document={querySelector:selector=>elements[selector]||null,querySelectorAll:()=>[],visibilityState:'visible',activeElement:null,
+  addEventListener(type,handler){(handlers[type]??=[]).push(handler);}};
+ class ClockDate extends Date{static now(){return clock;}}
+ const context=vm.createContext({console,document,window:{scrollTo(){}},Date:ClockDate,Intl,Set,URLSearchParams,FormData,AbortController,
+  fetch:async(path,options)=>{requests.push({path,options});return responder(path,requests.length,options);},
+  setTimeout(fn,delay){const next=++id;timers.set(next,{fn,delay});return next;},clearTimeout(key){timers.delete(key);},
+  setInterval(fn,delay){const next=++id;intervals.set(next,{fn,delay});return next;},clearInterval(key){intervals.delete(key);}});
+ await vm.runInContext(source,context);
+ async function settle(){for(let i=0;i<12;i++)await new Promise(resolve=>setImmediate(resolve));}
+ return {elements,timers,intervals,requests,context,
+  async retry(){const entry=[...timers.entries()].find(([,t])=>t.delay!==6500);assert(entry,'Expected a scheduled retry');const [key,timer]=entry;timers.delete(key);clock+=timer.delay;await timer.fn();await settle();},
+  async clickRetry(){const target={dataset:{action:'retry-boot'},disabled:false,isConnected:true};for(const handler of handlers.click||[])await handler({target:{closest:()=>target},preventDefault(){}});await settle();},
+  advance(ms){clock+=ms;},
+  async poll(){assert.equal(intervals.size,1);await [...intervals.values()][0].fn();},
+ };
+}
+
+function normal(path){if(path==='/health')return json(healthy);if(path==='/api/auth/me')return json({csrf:'test-csrf'});if(path==='/api/state')return json(emptyState);throw new Error('Unexpected request');}
+function noPreview(h){assert.doesNotMatch(h.elements['#app'].innerHTML,/Предпросмотр интерфейса|Сервер Telegram ещё не запущен/);assert.equal(h.elements['#dialog'].open,false);}
+
+test('429 with an HTML response waits for Retry-After without entering preview',async()=>{
+ const h=await harness(()=>new Response('<h1>Too many requests</h1>',{status:429,headers:{'Retry-After':'120','Content-Type':'text/html'}}));
+ noPreview(h);
+ assert.match(h.elements['#app'].innerHTML,/Сервер попросил подождать/);
+ assert.match(h.elements['#app'].innerHTML,/120 сек\./);
+ assert.equal([...h.timers.values()][0].delay,120000);
+ await h.clickRetry();
+ assert.equal(h.requests.length,1,'Manual retry must also respect Retry-After');
+ assert.equal(h.intervals.size,0);
+});
+
+for(const status of [404,500,502,503])test(`HTTP ${status} shows connection status instead of preview`,async()=>{
+ const h=await harness(()=>new Response('Unavailable',{status}));
+ noPreview(h);assert.match(h.elements['#app'].innerHTML,/data-connection-state=/);assert.equal(h.intervals.size,0);
+});
+
+for(const status of [401,403])test(`HTTP ${status} offers Site sign-in without a password-panel prompt`,async()=>{
+ const h=await harness(()=>json({detail:'Sign in required'},status));
+ noPreview(h);assert.match(h.elements['#app'].innerHTML,/signin-with-chatgpt/);assert.equal(h.timers.size,0);
+});
+
+test('Unexpected success payload and HTML do not activate preview',async()=>{
+ for(const response of [json({status:'ok'}),new Response('<html>Login page</html>',{headers:{'Content-Type':'text/html'}})]){
+  const h=await harness(()=>response);noPreview(h);assert.equal(h.intervals.size,0);
+ }
+});
+
+test('Only an explicit story-preview response activates the demo',async()=>{
+ const h=await harness(()=>json({service:'story-preview',ok:false,ready:false}));
+ assert.match(h.elements['#app'].innerHTML,/Предпросмотр интерфейса/);
+ assert.equal(h.timers.size,0);assert.equal(h.intervals.size,0);
+});
+
+test('A retry recovers into the live workspace and installs polling once',async()=>{
+ let healthCalls=0;
+ const h=await harness(path=>path==='/health'&&healthCalls++===0?new Response('Wait',{status:429,headers:{'Retry-After':'1'}}):normal(path));
+ noPreview(h);await h.retry();
+ assert.match(h.elements['#app'].innerHTML,/Всё под контролем/);
+ assert.equal(h.intervals.size,1);
+ assert.equal(h.timers.size,0);
+ await vm.runInContext('boot()',h.context);
+ assert.equal(h.intervals.size,1);
+});
+
+test('Readiness false waits before authenticating and recovers automatically',async()=>{
+ let healthCalls=0;
+ const h=await harness(path=>path==='/health'&&healthCalls++===0?json({...healthy,ready:false}):normal(path));
+ noPreview(h);assert.equal(h.requests.length,1);assert.match(h.elements['#app'].innerHTML,/восстанавливать данные/);
+ await h.retry();assert.equal(h.intervals.size,1);
+});
+
+for(const path of ['/api/auth/me','/api/state'])test(`An HTML 429 during ${path} retains its retry status`,async()=>{
+ const h=await harness(url=>url===path?new Response('Rate limited',{status:429,headers:{'Retry-After':'70'}}):normal(url));
+ noPreview(h);assert.match(h.elements['#app'].innerHTML,/70 сек\./);assert.equal(h.intervals.size,0);
+});
+
+test('Retry-After HTTP dates are observed',async()=>{
+ const date=new Date(Date.now()+120000).toUTCString();
+ const h=await harness(()=>new Response('Wait',{status:429,headers:{'Retry-After':date}}));
+ const delay=[...h.timers.values()][0].delay;
+ assert(delay>118000&&delay<=120000);
+});
+
+test('Password-panel login keeps a poller ready for successful authentication',async()=>{
+ const h=await harness(path=>path==='/api/auth/me'?json({detail:'Войдите в панель.'},401):normal(path));
+ assert.equal(h.elements['#dialog'].open,true);
+ assert.match(h.elements['#dialog'].innerHTML,/Пароль панели/);
+ assert.equal(h.intervals.size,1);
+ const count=h.requests.length;await h.poll();assert.equal(h.requests.length,count);
+});
+
+test('Network failures stop automatic attempts after a bounded number',async()=>{
+ const h=await harness(()=>{throw new TypeError('Network failure');});
+ for(let i=0;i<11;i++){noPreview(h);await h.retry();}
+ assert.equal(h.requests.length,12);assert.equal(h.timers.size,0);
+ assert.match(h.elements['#app'].innerHTML,/Автоматические попытки приостановлены/);
+});
+
+test('A background 429 pauses reads rather than polling every five seconds',async()=>{
+ let stateCalls=0;
+ const h=await harness(path=>path==='/api/state'&&stateCalls++>0?new Response('Wait',{status:429,headers:{'Retry-After':'90'}}):normal(path));
+ await h.poll();const count=h.requests.length;
+ h.advance(5000);await h.poll();assert.equal(h.requests.length,count);
+ h.advance(85000);await h.poll();assert.equal(h.requests.length,count+1);
+});
