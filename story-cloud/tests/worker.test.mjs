@@ -2,7 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 
-const source=(await readFile(new URL('../worker/index.js',import.meta.url),'utf8')).replace('__STORY_ASSETS__',JSON.stringify({'/index.html':{content:'<h1>Лупа</h1>',type:'text/html'}}));
+const source=(await readFile(new URL('../worker/index.js',import.meta.url),'utf8')).replace('__STORY_ASSETS__',JSON.stringify({'/index.html':{content:'<html><head></head><body><h1>Лупа</h1></body></html>',type:'text/html'}}));
 const worker=(await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'))).default;
 class Bucket{
  objects=new Map();count=0;
@@ -124,4 +124,14 @@ test('Read-only health endpoint supports HEAD and rejects mutations',async()=>{
   const head=await worker.fetch(request('/health','HEAD'),e);assert.equal(head.status,200);assert.equal(await head.text(),'');
   const post=await worker.fetch(request('/health','POST'),e);assert.equal(post.status,405);
  }finally{globalThis.fetch=previous;}
+});
+test('Frontend receives only a public browser wake URL without credentials',async()=>{
+ const e=env();e.BACKEND_URL='https://our-app.onrender.com';
+ const r=await worker.fetch(request('/'),e),body=await r.text();
+ assert.match(body,/name="story-backend-wake" content="https:\/\/our-app.onrender.com\/health"/);
+ assert.doesNotMatch(body,/a-test-secret|site-owner|credential/);
+ for(const bad of ['http://our-app.onrender.com','https://user:password@our-app.onrender.com','https://evil.example']){
+  e.BACKEND_URL=bad;const response=await worker.fetch(request('/'),e);
+  assert.doesNotMatch(await response.text(),/story-backend-wake/);
+ }
 });

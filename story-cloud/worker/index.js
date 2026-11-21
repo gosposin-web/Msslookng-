@@ -48,6 +48,16 @@ function healthResponse(result,head=false){
  if(result.status!==200)headers['Retry-After']=String(Math.max(1,Math.ceil((result.until-Date.now())/1000)));
  return head?new Response(null,{status:result.status,headers}):json(result.payload,result.status,headers);
 }
+function frontendContent(asset,env){
+ if(!asset.type.startsWith('text/html')||!env.BACKEND_URL)return asset.content;
+ try{
+  const wake=new URL('/health',env.BACKEND_URL);
+  if(wake.protocol!=='https:'||!wake.hostname.endsWith('.onrender.com')||wake.username||wake.password||wake.port)return asset.content;
+  // Public health URL only. This lets an active user's browser wake a sleeping
+  // free instance even if server-to-server traffic receives 429 before startup.
+  return asset.content.replace('</head>',`<meta name="story-backend-wake" content="${wake.href}"></head>`);
+ }catch{return asset.content;}
+}
 
 async function equalSecret(value,expected){
  if(!value||!expected)return false;
@@ -139,6 +149,6 @@ export default {
   if(request.method!=='GET'&&request.method!=='HEAD')return json({error:'Method not allowed'},405);
   const asset=ASSETS[url.pathname==='/'?'/index.html':url.pathname];
   if(!asset)return new Response('Not found',{status:404});
-  return new Response(request.method==='HEAD'?null:asset.content,{headers:{'Content-Type':asset.type,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'}});
+  return new Response(request.method==='HEAD'?null:frontendContent(asset,env),{headers:{'Content-Type':asset.type,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'}});
  }
 };

@@ -11,20 +11,22 @@ const json=(data,status=200,headers={})=>Response.json(data,{status,headers});
 
 // Run the actual browser script with a small DOM boundary and a controllable clock.
 // No Telegram calls, browser installation, or live credentials are involved.
-async function harness(responder){
+async function harness(responder,wakeUrl=''){
  let clock=Date.now(),id=0;
  const timers=new Map(),intervals=new Map(),handlers={},requests=[];
  const el=()=>({innerHTML:'',textContent:'',dataset:{},open:false,classList:{add(){},remove(){}},addEventListener(){},showModal(){this.open=true;},close(){this.open=false;}});
  const elements={'#app':el(),'#dialog':el(),'#toast':el()};
+ if(wakeUrl)elements['meta[name="story-backend-wake"]']={content:wakeUrl};
  const document={querySelector:selector=>elements[selector]||null,querySelectorAll:()=>[],visibilityState:'visible',activeElement:null,
   addEventListener(type,handler){(handlers[type]??=[]).push(handler);}};
  class ClockDate extends Date{static now(){return clock;}}
- const context=vm.createContext({console,document,window:{scrollTo(){}},Date:ClockDate,Intl,Set,URLSearchParams,FormData,AbortController,crypto:webcrypto,
+ const context=vm.createContext({console,document,window:{scrollTo(){}},Date:ClockDate,Intl,Set,URL,URLSearchParams,FormData,AbortController,crypto:webcrypto,
   fetch:async(path,options)=>{requests.push({path,options});return responder(path,requests.length,options);},
   setTimeout(fn,delay){const next=++id;timers.set(next,{fn,delay});return next;},clearTimeout(key){timers.delete(key);},
   setInterval(fn,delay){const next=++id;intervals.set(next,{fn,delay});return next;},clearInterval(key){intervals.delete(key);}});
  await vm.runInContext(source,context);
  async function settle(){for(let i=0;i<12;i++)await new Promise(resolve=>setImmediate(resolve));}
+ await settle();
  return {elements,timers,intervals,requests,context,
   async retry(){const entry=[...timers.entries()].find(([,t])=>t.delay!==6500);assert(entry,'Expected a scheduled retry');const [key,timer]=entry;timers.delete(key);clock+=timer.delay;await timer.fn();await settle();},
   async clickRetry(){const target={dataset:{action:'retry-boot'},disabled:false,isConnected:true};for(const handler of handlers.click||[])await handler({target:{closest:()=>target},preventDefault(){}});await settle();},
@@ -153,4 +155,33 @@ test('A 200-chat queue is summarized and additional jobs can be shown',async()=>
  assert.equal((html.match(/class='job-card'/g)||[]).length,40);
  await h.clickAction('more-jobs');html=h.elements['#app'].innerHTML;
  assert.equal((html.match(/class='job-card'/g)||[]).length,80);
+});
+
+test('A browser visit wakes the backend once and recovers from the proxy cold-start 429',async()=>{
+ const wake='https://our-app.onrender.com/health';let awake=false,wakes=0;
+ const h=await harness((path,count,options)=>{
+  if(path===wake){wakes++;assert.equal(options.mode,'no-cors');assert.equal(options.credentials,'omit');assert.equal(options.referrerPolicy,'no-referrer');assert.equal(options.redirect,'error');assert.equal(options.headers,undefined);return Promise.resolve().then(()=>{awake=true;return new Response('opaque');});}
+  if(path==='/health'&&!awake)return new Response('backend asleep',{status:429,headers:{'Retry-After':'30'}});
+  return normal(path);
+ },wake);
+ assert.match(h.elements['#app'].innerHTML,/Подключаемся к серверу/);
+ assert.doesNotMatch(h.elements['#app'].innerHTML,/Сервер попросил подождать/);
+ await h.retry();
+ assert.match(h.elements['#app'].innerHTML,/Всё под контролем/);
+ assert.equal(wakes,1);assert.equal(h.intervals.size,1);
+ await vm.runInContext('boot()',h.context);assert.equal(wakes,1);
+});
+
+test('A blocked browser wake does not prevent the ordinary authenticated proxy from working',async()=>{
+ const wake='https://our-app.onrender.com/health';
+ const h=await harness(path=>{if(path===wake)throw new TypeError('browser request blocked');return normal(path);},wake);
+ assert.match(h.elements['#app'].innerHTML,/Всё под контролем/);
+ assert.equal(h.intervals.size,1);
+});
+
+test('Browser wake cannot send requests to arbitrary or credential-bearing URLs',async()=>{
+ for(const wake of ['https://evil.example/health','https://user:password@our-app.onrender.com/health','https://our-app.onrender.com/health?secret=value','http://our-app.onrender.com/health']){
+  const h=await harness(normal,wake);
+  assert.equal(h.requests.some(r=>String(r.path).startsWith('http')),false);
+ }
 });

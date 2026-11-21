@@ -220,6 +220,23 @@ document.addEventListener('submit',async e=>{
  finally{if(submit.isConnected){submit.disabled=false;submit.innerHTML=original;if(form.id==='chat-file-form')form.querySelector('fieldset').disabled=false;}}
 });
 let bootRetries=0,bootTimer=null,booting=false,bootRetryAt=0,pollTimer=null,pollRetryAt=0;
+let backendWakeAttempted=false,backendWakeStartedAt=0;
+function wakeBackendFromBrowser(){
+ if(backendWakeAttempted)return;
+ backendWakeAttempted=true;
+ const raw=document.querySelector('meta[name="story-backend-wake"]')?.content;
+ if(!raw)return;
+ let url;
+ try{url=new URL(raw);}catch{return;}
+ if(url.protocol!=='https:'||!url.hostname.endsWith('.onrender.com')||url.port||url.username||url.password||url.pathname!=='/health'||url.search||url.hash)return;
+ backendWakeStartedAt=Date.now();
+ const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),65000);
+ // One request per actual page opening, with no credentials or identity. This
+ // is an active-user cold start, not a background keepalive or a retry loop.
+ void fetch(url.href,{method:'GET',mode:'no-cors',credentials:'omit',cache:'no-store',
+                     referrerPolicy:'no-referrer',redirect:'error',signal:controller.signal})
+  .catch(()=>{}).finally(()=>clearTimeout(timeout));
+}
 function retryDelay(response,fallback){
  const value=response.headers.get('Retry-After');
  if(value===null||!value.trim())return fallback;
@@ -229,7 +246,8 @@ function retryDelay(response,fallback){
 }
 function connectionIssue(status,delay){
  clearTimeout(bootTimer);bootTimer=null;
- const signIn=status===401||status===403,limited=status===429,waking=status==='waking'||status===503;
+ const startup=backendWakeStartedAt>0&&Date.now()-backendWakeStartedAt<90000&&[0,429,503].includes(status);
+ const signIn=status===401||status===403,limited=status===429&&!startup,waking=startup||status==='waking'||status===503;
  const heading=signIn?'Нужно войти в панель':limited?'Сервер попросил подождать':waking?'Подключаемся к серверу':'Не удалось связаться с сервером';
  const message=signIn?'Откройте личную панель через вход с ChatGPT.':limited?'Сервер временно ограничил частоту запросов. Это не ошибка вашего tdata.':waking?'Бесплатный сервер может просыпаться или восстанавливать данные. Подключение может занять около минуты.':'Рабочий сервер пока не подтвердил соединение. Проверьте интернет или повторите попытку позже.';
  const attempt=++bootRetries,automatic=!signIn&&attempt<12;
@@ -256,6 +274,7 @@ async function boot(){
  clearTimeout(bootTimer);bootTimer=null;booting=true;
  app.innerHTML=`<div class='boot'><span class='brand-mark'>л</span><p>Подключаемся к рабочему серверу…</p></div>`;
  try{
+  wakeBackendFromBrowser();
   const controller=new AbortController();
   const timeout=setTimeout(()=>controller.abort(),65000);
   let response,h;
