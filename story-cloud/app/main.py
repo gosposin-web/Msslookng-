@@ -2,6 +2,7 @@ import asyncio
 import csv
 import hashlib
 import hmac
+import html
 import io
 import json
 import logging
@@ -11,6 +12,7 @@ import tempfile
 import uuid
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -118,6 +120,16 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
     gateway=gateway_factory(db,cipher)
     storage=SnapshotStore(db,config) if config.snapshot_site_url else None
     worker=Worker(db,gateway,storage)
+    # An unprivileged readiness document may be embedded only by the configured
+    # panel. The return URL is configuration, never a visitor-supplied URL.
+    try:
+        origin=urlsplit(config.public_origin)
+        wake_origin=(config.public_origin.rstrip('/') if origin.scheme=='https' and origin.hostname
+                     and re.fullmatch(r'[A-Za-z0-9.-]+',origin.hostname) and not origin.username
+                     and not origin.password and not origin.port and origin.path in ('','/')
+                     and not origin.query and not origin.fragment else '')
+    except ValueError:
+        wake_origin=''
     logging.getLogger('telethon').setLevel(logging.CRITICAL)
     logging.getLogger('opentele').setLevel(logging.CRITICAL)
 
@@ -166,6 +178,10 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
         response.headers['Referrer-Policy']='no-referrer'
         response.headers['X-Frame-Options']='DENY'
         response.headers['Content-Security-Policy']="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; script-src 'self'; connect-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+        if request.url.path=='/wake' and wake_origin and response.status_code==200:
+            # /wake contains only public readiness and a fixed return link.
+            del response.headers['X-Frame-Options']
+            response.headers['Content-Security-Policy']=response.headers['Content-Security-Policy'].replace("frame-ancestors 'none'",'frame-ancestors '+wake_origin)
         if config.cookie_secure:
             response.headers['Strict-Transport-Security']='max-age=31536000'
         return response
@@ -206,6 +222,13 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
     def health():
         return {'ok':True,'service':'story-cloud','ready':not storage or storage.ready,'mode':'free' if config.free_mode else 'standard',
                 'api_mode':'custom' if config.telegram_api_id and config.telegram_api_hash else 'public' if config.public_api_defaults else 'required'}
+
+    @app.get('/wake',response_class=Response)
+    def wake():
+        if not wake_origin:
+            raise HTTPException(404,'Страница запуска не настроена.')
+        return Response((STATIC/'wake.html').read_text().replace('__STORY_PANEL_ORIGIN__',html.escape(wake_origin,quote=True)),
+                        media_type='text/html',headers={'Cache-Control':'no-store'})
 
     @app.post('/api/auth/login')
     def login(body: LoginInput, request: Request, response: Response):

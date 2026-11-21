@@ -11,25 +11,29 @@ const json=(data,status=200,headers={})=>Response.json(data,{status,headers});
 
 // Run the actual browser script with a small DOM boundary and a controllable clock.
 // No Telegram calls, browser installation, or live credentials are involved.
-async function harness(responder,wakeUrl=''){
+async function harness(responder,wakeUrl='',returned=false){
  let clock=Date.now(),id=0;
  const timers=new Map(),intervals=new Map(),handlers={},requests=[];
- const el=()=>({innerHTML:'',textContent:'',dataset:{},open:false,isConnected:true,classList:{add(){},remove(){}},replaceChildren(...children){this.innerHTML='';this.textContent=children.map(c=>c.textContent).join('');},append(child){this.textContent+=child.textContent;},addEventListener(){},showModal(){this.open=true;},close(){this.open=false;}});
+ const frames=[],navigations=[];
+ const el=()=>({innerHTML:'',textContent:'',dataset:{},open:false,isConnected:true,contentWindow:{},setAttribute(){},remove(){this.removed=true;},classList:{add(){},remove(){}},replaceChildren(...children){this.innerHTML='';this.textContent=children.map(c=>c.textContent).join('');},append(child){this.textContent+=child.textContent;},addEventListener(){},showModal(){this.open=true;},close(){this.open=false;}});
  const elements={'#app':el(),'#dialog':el(),'#toast':el(),'#people-add-error':el(),'#people-file-error':el()};
  if(wakeUrl)elements['meta[name="story-backend-wake"]']={content:wakeUrl};
- const document={querySelector:selector=>elements[selector]||null,getElementById:id=>elements['#'+id]||null,createElement:()=>el(),querySelectorAll:()=>[],visibilityState:'visible',activeElement:null,
+ const document={body:{append(frame){frames.push(frame);}},querySelector:selector=>elements[selector]||null,getElementById:id=>elements['#'+id]||null,createElement:()=>el(),querySelectorAll:()=>[],visibilityState:'visible',activeElement:null,
   addEventListener(type,handler){(handlers[type]??=[]).push(handler);}};
  class ClockDate extends Date{static now(){return clock;}}
  class BrowserFormData extends FormData{constructor(form){super();for(const [name,value] of Object.entries(form?.fields||{}))this.append(name,value);}}
- const context=vm.createContext({console,document,window:{scrollTo(){}},Date:ClockDate,Intl,Set,URL,URLSearchParams,FormData:BrowserFormData,AbortController,crypto:webcrypto,
+ const window={scrollTo(){},location:{hash:returned?'#server-started':'',pathname:'/',search:'',replace:url=>navigations.push(url)},history:{replaceState(){}},addEventListener(type,handler){(handlers['window:'+type]??=[]).push(handler);}};
+ const context=vm.createContext({console,document,window,Date:ClockDate,Intl,Set,URL,URLSearchParams,FormData:BrowserFormData,AbortController,crypto:webcrypto,
   fetch:async(path,options)=>{requests.push({path,options});return responder(path,requests.length,options);},
-  setTimeout(fn,delay){const next=++id;timers.set(next,{fn,delay});return next;},clearTimeout(key){timers.delete(key);},
+  setTimeout(fn,delay){const next=++id;timers.set(next,{fn,delay,due:clock+delay});return next;},clearTimeout(key){timers.delete(key);},
   setInterval(fn,delay){const next=++id;intervals.set(next,{fn,delay});return next;},clearInterval(key){intervals.delete(key);}});
  await vm.runInContext(source,context);
  async function settle(){for(let i=0;i<12;i++)await new Promise(resolve=>setImmediate(resolve));}
  await settle();
- return {elements,timers,intervals,requests,context,
-  async retry(){const entry=[...timers.entries()].find(([,t])=>t.delay!==6500);assert(entry,'Expected a scheduled retry');const [key,timer]=entry;timers.delete(key);clock+=timer.delay;await timer.fn();await settle();},
+ return {elements,timers,intervals,requests,context,frames,navigations,
+  async retry(){const entry=[...timers.entries()].filter(([,t])=>t.delay!==6500).sort((a,b)=>a[1].due-b[1].due)[0];assert(entry,'Expected a scheduled retry');const [key,timer]=entry;timers.delete(key);clock=Math.max(clock,timer.due);await timer.fn();await settle();},
+  async message(event){for(const handler of handlers['window:message']||[])await handler(event);await settle();},
+  async visibility(value){document.visibilityState=value;for(const handler of handlers.visibilitychange||[])await handler();await settle();},
   async clickRetry(){const target={dataset:{action:'retry-boot'},disabled:false,isConnected:true};for(const handler of handlers.click||[])await handler({target:{closest:()=>target},preventDefault(){}});await settle();},
   async clickAction(action){const target={dataset:{action},disabled:false,isConnected:true};for(const handler of handlers.click||[])await handler({target:{closest:()=>target},preventDefault(){}});await settle();},
   async submitForm(id,fields){const submit={innerHTML:'Добавить',textContent:'Добавить',isConnected:true},fieldset={disabled:false};const form={id,fields,matches:()=>false,querySelector:selector=>selector==='fieldset'?fieldset:submit};for(const handler of handlers.submit||[])await handler({target:form,preventDefault(){}});await settle();return {submit,fieldset};},
@@ -44,8 +48,7 @@ function noPreview(h){assert.doesNotMatch(h.elements['#app'].innerHTML,/Пред
 test('429 with an HTML response waits for Retry-After without entering preview',async()=>{
  const h=await harness(()=>new Response('<h1>Too many requests</h1>',{status:429,headers:{'Retry-After':'120','Content-Type':'text/html'}}));
  noPreview(h);
- assert.match(h.elements['#app'].innerHTML,/Сервер попросил подождать/);
- assert.match(h.elements['#app'].innerHTML,/120 сек\./);
+ assert.match(h.elements['#app'].innerHTML,/Подключение повторится автоматически/);
  assert.equal([...h.timers.values()][0].delay,120000);
  await h.clickRetry();
  assert.equal(h.requests.length,1,'Manual retry must also respect Retry-After');
@@ -88,13 +91,13 @@ test('A retry recovers into the live workspace and installs polling once',async(
 test('Readiness false waits before authenticating and recovers automatically',async()=>{
  let healthCalls=0;
  const h=await harness(path=>path==='/health'&&healthCalls++===0?json({...healthy,ready:false}):normal(path));
- noPreview(h);assert.equal(h.requests.length,1);assert.match(h.elements['#app'].innerHTML,/восстанавливать данные/);
+ noPreview(h);assert.equal(h.requests.length,1);assert.match(h.elements['#app'].innerHTML,/автоматически/);
  await h.retry();assert.equal(h.intervals.size,1);
 });
 
 for(const path of ['/api/auth/me','/api/state'])test(`An HTML 429 during ${path} retains its retry status`,async()=>{
  const h=await harness(url=>url===path?new Response('Rate limited',{status:429,headers:{'Retry-After':'70'}}):normal(url));
- noPreview(h);assert.match(h.elements['#app'].innerHTML,/70 сек\./);assert.equal(h.intervals.size,0);
+ noPreview(h);assert.equal([...h.timers.values()][0].delay,70000);assert.equal(h.intervals.size,0);
 });
 
 test('Retry-After HTTP dates are observed',async()=>{
@@ -112,11 +115,11 @@ test('Password-panel login keeps a poller ready for successful authentication',a
  const count=h.requests.length;await h.poll();assert.equal(h.requests.length,count);
 });
 
-test('Network failures stop automatic attempts after a bounded number',async()=>{
+test('Connection keeps retrying automatically on an active page without an arbitrary attempt cutoff',async()=>{
  const h=await harness(()=>{throw new TypeError('Network failure');});
- for(let i=0;i<11;i++){noPreview(h);await h.retry();}
- assert.equal(h.requests.length,12);assert.equal(h.timers.size,0);
- assert.match(h.elements['#app'].innerHTML,/Автоматические попытки приостановлены/);
+ for(let i=0;i<15;i++){noPreview(h);await h.retry();}
+ assert.equal(h.requests.length,16);assert.equal(h.timers.size,1);
+ assert.match(h.elements['#app'].innerHTML,/Нажимать «Повторить» не нужно/);
 });
 
 test('A background 429 pauses reads rather than polling every five seconds',async()=>{
@@ -159,32 +162,58 @@ test('A 200-chat queue is summarized and additional jobs can be shown',async()=>
  assert.equal((html.match(/class='job-card'/g)||[]).length,80);
 });
 
-test('A browser visit wakes the backend once and recovers from the proxy cold-start 429',async()=>{
- const wake='https://our-app.onrender.com/health';let awake=false,wakes=0;
- const h=await harness((path,count,options)=>{
-  if(path===wake){wakes++;assert.equal(options.mode,'no-cors');assert.equal(options.credentials,'omit');assert.equal(options.referrerPolicy,'no-referrer');assert.equal(options.redirect,'error');assert.equal(options.headers,undefined);return Promise.resolve().then(()=>{awake=true;return new Response('opaque');});}
-  if(path==='/health'&&!awake)return new Response('backend asleep',{status:429,headers:{'Retry-After':'30'}});
-  return normal(path);
- },wake);
- assert.match(h.elements['#app'].innerHTML,/Подключаемся к серверу/);
- assert.doesNotMatch(h.elements['#app'].innerHTML,/Сервер попросил подождать/);
+test('Readiness navigation wakes once, verifies its sender and recovers through the private proxy',async()=>{
+ const wake='https://our-app.onrender.com/wake';let awake=false;
+ const h=await harness(path=>path==='/health'&&!awake?new Response('backend asleep',{status:429,headers:{'Retry-After':'30'}}):normal(path),wake);
+ assert.equal(h.frames.length,1);assert.equal(h.frames[0].src,wake);
+ assert.equal(h.frames[0].referrerPolicy,'no-referrer');
+ assert.equal(h.requests.some(r=>r.path.startsWith('http')),false);
+ assert.match(h.elements['#app'].innerHTML,/Запускаем облачную панель/);
+ const initial=h.requests.length;
+ await h.message({source:h.frames[0].contentWindow,origin:'https://evil.example',data:{type:'story-backend-ready'}});
+ assert.equal(vm.runInContext('backendWakeConfirmed',h.context),false);
+ awake=true;
+ await h.message({source:h.frames[0].contentWindow,origin:'https://our-app.onrender.com',data:{type:'story-backend-ready'}});
+ assert.equal(h.requests.length,initial,'A frame message cannot override the proxy Retry-After');
  await h.retry();
  assert.match(h.elements['#app'].innerHTML,/Всё под контролем/);
- assert.equal(wakes,1);assert.equal(h.intervals.size,1);
- await vm.runInContext('boot()',h.context);assert.equal(wakes,1);
+ assert.equal(h.frames.length,1);assert.equal(h.frames[0].removed,true);assert.equal(h.intervals.size,1);
+ assert.equal(h.navigations.length,0);
 });
 
-test('A blocked browser wake does not prevent the ordinary authenticated proxy from working',async()=>{
- const wake='https://our-app.onrender.com/health';
- const h=await harness(path=>{if(path===wake)throw new TypeError('browser request blocked');return normal(path);},wake);
- assert.match(h.elements['#app'].innerHTML,/Всё под контролем/);
- assert.equal(h.intervals.size,1);
+test('A failed background frame automatically opens the normal startup page instead of waiting forever',async()=>{
+ const wake='https://our-app.onrender.com/wake';
+ const h=await harness(()=>new Response('Wait',{status:429,headers:{'Retry-After':'30'}}),wake);
+ await h.retry();assert.equal(h.navigations.length,0);
+ await h.retry();assert.deepEqual(h.navigations,[wake]);
+ assert.equal(h.frames[0].removed,true);
 });
 
-test('Browser wake cannot send requests to arbitrary or credential-bearing URLs',async()=>{
- for(const wake of ['https://evil.example/health','https://user:password@our-app.onrender.com/health','https://our-app.onrender.com/health?secret=value','http://our-app.onrender.com/health']){
-  const h=await harness(normal,wake);
-  assert.equal(h.requests.some(r=>String(r.path).startsWith('http')),false);
+test('The startup return marker prevents an automatic navigation loop',async()=>{
+ const h=await harness(()=>new Response('Wait',{status:429,headers:{'Retry-After':'30'}}),'https://our-app.onrender.com/wake',true);
+ for(let i=0;i<6;i++)await h.retry();
+ assert.equal(h.navigations.length,0);assert(h.requests.length>=5);
+});
+
+test('Returning from a suspended phone tab reconnects automatically and hidden tabs do not poll',async()=>{
+ let attempts=0;
+ const h=await harness(path=>path==='/health'&&attempts++===0?new Response('Wait',{status:503,headers:{'Retry-After':'30'}}):normal(path));
+ await h.visibility('hidden');const count=h.requests.length;h.advance(60000);
+ assert.equal(h.timers.size,0);assert.equal(h.requests.length,count);
+ await h.visibility('visible');
+ assert.match(h.elements['#app'].innerHTML,/Всё под контролем/);assert.equal(h.intervals.size,1);
+});
+
+test('A connection loss after startup restarts the connection flow and installs polling only once',async()=>{
+ let reads=0;
+ const h=await harness(path=>path==='/api/state'&&reads++===1?json({detail:'Server restoring'},503):normal(path));
+ await h.poll();assert.match(h.elements['#app'].innerHTML,/Всё под контролем/);assert.equal(h.intervals.size,1);
+ assert.equal(h.requests.filter(r=>r.path==='/health').length,2);
+});
+
+test('Browser readiness navigation rejects arbitrary and credential-bearing destinations',async()=>{
+ for(const wake of ['https://evil.example/wake','https://user:password@our-app.onrender.com/wake','https://our-app.onrender.com/wake?secret=value','http://our-app.onrender.com/wake']){
+  const h=await harness(normal,wake);assert.equal(h.frames.length,0);assert.equal(h.navigations.length,0);
  }
 });
 

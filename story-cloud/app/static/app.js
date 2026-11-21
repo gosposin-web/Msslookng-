@@ -165,7 +165,8 @@ document.addEventListener('click',async e=>{
  const action=target.dataset.action,id=target.dataset.id;
  try{
   if(action==='close-dialog'){if(dialog.dataset.login!=='true')dialog.close();return;}
-  if(action==='retry-boot'){if(Date.now()<bootRetryAt){toast('Следующая проверка будет доступна через '+Math.ceil((bootRetryAt-Date.now())/1000)+' сек.');return;}bootRetries=0;await boot();return;}
+  if(action==='retry-boot'){if(Date.now()<bootRetryAt){scheduleBoot();return;}await boot();return;}
+  if(action==='wake-server'){if(backendWakeUrl)window.location.replace(backendWakeUrl.href);return;}
   if(action==='add-source'){addSource();return;}
   if(action==='import-chats'){if(online())importChats();return;}
   if(action==='import-people'){if(online())importPeople();return;}
@@ -238,8 +239,19 @@ document.addEventListener('submit',async e=>{
  }catch(err){if(errEl&&errEl.isConnected)showError(errEl,err);else toast(err.message);}
  finally{if(submit.isConnected){submit.disabled=false;submit.innerHTML=original;if(['chat-file-form','people-file-form'].includes(form.id))form.querySelector('fieldset').disabled=false;}}
 });
-let bootRetries=0,bootTimer=null,booting=false,bootRetryAt=0,pollTimer=null,pollRetryAt=0;
-let backendWakeAttempted=false,backendWakeStartedAt=0;
+let bootRetries=0,bootTimer=null,booting=false,bootRetryAt=0,pollTimer=null,pollRetryAt=0,connectionPending=false;
+let backendWakeAttempted=false,backendWakeStartedAt=0,backendWakeFrame=null,backendWakeUrl=null,backendWakeTimer=null,backendWakeConfirmed=false;
+let returnedFromWake=window.location?.hash==='#server-started';
+if(returnedFromWake)window.history?.replaceState(null,'',window.location.pathname+window.location.search);
+function stopBackendWake(){
+ clearTimeout(backendWakeTimer);backendWakeTimer=null;
+ backendWakeFrame?.remove();backendWakeFrame=null;
+}
+function openBackendWake(){
+ if(!backendWakeUrl||backendWakeConfirmed||!connectionPending||returnedFromWake||document.visibilityState==='hidden')return;
+ stopBackendWake();
+ window.location.replace(backendWakeUrl.href);
+}
 function wakeBackendFromBrowser(){
  if(backendWakeAttempted)return;
  backendWakeAttempted=true;
@@ -247,15 +259,43 @@ function wakeBackendFromBrowser(){
  if(!raw)return;
  let url;
  try{url=new URL(raw);}catch{return;}
- if(url.protocol!=='https:'||!url.hostname.endsWith('.onrender.com')||url.port||url.username||url.password||url.pathname!=='/health'||url.search||url.hash)return;
- backendWakeStartedAt=Date.now();
- const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),65000);
- // One request per actual page opening, with no credentials or identity. This
- // is an active-user cold start, not a background keepalive or a retry loop.
- void fetch(url.href,{method:'GET',mode:'no-cors',credentials:'omit',cache:'no-store',
-                     referrerPolicy:'no-referrer',redirect:'error',signal:controller.signal})
-  .catch(()=>{}).finally(()=>clearTimeout(timeout));
+ if(url.protocol!=='https:'||!url.hostname.endsWith('.onrender.com')||url.port||url.username||url.password||url.pathname!=='/wake'||url.search||url.hash)return;
+ backendWakeUrl=url;backendWakeStartedAt=Date.now();backendWakeConfirmed=false;
+ // Navigation follows the host's cold-start document. No account data or
+ // credentials are included in the URL, frame, message, or public health call.
+ const frame=document.createElement('iframe');
+ frame.src=url.href;frame.title='Запуск облачного сервера';frame.hidden=true;
+ frame.referrerPolicy='no-referrer';frame.setAttribute('aria-hidden','true');frame.setAttribute('tabindex','-1');
+ backendWakeFrame=frame;document.body.append(frame);
+ backendWakeTimer=setTimeout(openBackendWake,45000);
 }
+window.addEventListener('message',event=>{
+ if(!backendWakeFrame||event.source!==backendWakeFrame.contentWindow||event.origin!==backendWakeUrl?.origin||event.data?.type!=='story-backend-ready')return;
+ backendWakeConfirmed=true;stopBackendWake();
+ if(connectionPending)resumeBoot();
+});
+function scheduleBoot(){
+ clearTimeout(bootTimer);bootTimer=null;
+ if(!connectionPending||document.visibilityState==='hidden')return;
+ const remaining=bootRetryAt-Date.now();
+ if(remaining<=0){void boot();return;}
+ bootTimer=setTimeout(resumeBoot,Math.min(remaining,2147483647));
+}
+function resumeBoot(){
+ if(!connectionPending||document.visibilityState==='hidden')return;
+ if(backendWakeStartedAt&&Date.now()-backendWakeStartedAt>=45000&&!backendWakeConfirmed&&!returnedFromWake){openBackendWake();return;}
+ scheduleBoot();
+}
+async function reconnect(){
+ if(connectionPending||booting)return;
+ clearInterval(pollTimer);pollTimer=null;
+ server=false;authenticated=false;connectionPending=true;bootRetryAt=0;bootRetries=0;
+ stopBackendWake();backendWakeAttempted=false;backendWakeStartedAt=0;backendWakeConfirmed=false;
+ await boot();
+}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'){clearTimeout(bootTimer);bootTimer=null;}else resumeBoot();});
+window.addEventListener('online',resumeBoot);
+window.addEventListener('pageshow',event=>{if(event.persisted&&server&&authenticated)void reconnect();else resumeBoot();});
 function retryDelay(response,fallback){
  const value=response.headers.get('Retry-After');
  if(value===null||!value.trim())return fallback;
@@ -265,18 +305,17 @@ function retryDelay(response,fallback){
 }
 function connectionIssue(status,delay){
  clearTimeout(bootTimer);bootTimer=null;
- const startup=backendWakeStartedAt>0&&Date.now()-backendWakeStartedAt<90000&&[0,429,503].includes(status);
- const signIn=status===401||status===403,limited=status===429&&!startup,waking=startup||status==='waking'||status===503;
- const heading=signIn?'Нужно войти в панель':limited?'Сервер попросил подождать':waking?'Подключаемся к серверу':'Не удалось связаться с сервером';
- const message=signIn?'Откройте личную панель через вход с ChatGPT.':limited?'Сервер временно ограничил частоту запросов. Это не ошибка вашего tdata.':waking?'Бесплатный сервер может просыпаться или восстанавливать данные. Подключение может занять около минуты.':'Рабочий сервер пока не подтвердил соединение. Проверьте интернет или повторите попытку позже.';
- const attempt=++bootRetries,automatic=!signIn&&attempt<12;
- const wait=signIn?0:delay??Math.min(30000,3000*2**Math.floor((attempt-1)/3));
+ const signIn=status===401||status===403;
+ connectionPending=!signIn;
+ if(signIn)stopBackendWake();
+ const waking=!signIn&&!!backendWakeUrl;
+ const heading=signIn?'Нужно войти в панель':waking?'Запускаем облачную панель':'Восстанавливаем подключение';
+ const message=signIn?'Откройте личную панель через вход с ChatGPT.':waking?'Подключаем автоматически. Если фоновый запуск не завершится, откроем страницу сервера и вернём вас в панель.':'Сервер пока недоступен. Подключение повторится автоматически, пока эта страница открыта.';
+ const attempt=++bootRetries;
+ const wait=signIn?0:delay??Math.min(60000,5000*2**Math.floor((attempt-1)/3));
  bootRetryAt=Date.now()+wait;
- app.innerHTML=`<div class='boot connection-state' data-connection-state='${signIn?'signin':limited?'limited':waking?'waking':'unavailable'}'><span class='brand-mark'>л</span><h1>${heading}</h1><p>${message}</p>${automatic?`<p class='connection-retry' role='status'>Повторим проверку через ${Math.ceil(wait/1000)} сек.</p>`:signIn?'':`<p class='connection-retry'>Автоматические попытки приостановлены. Повторите проверку вручную.</p>`}${signIn?`<a class='btn primary' href='/signin-with-chatgpt?return_to=%2F' target='_top'>Войти через ChatGPT</a>`:button('retry-boot','Повторить проверку','light')}</div>`;
- if(automatic){
-  const resume=()=>{const remaining=bootRetryAt-Date.now();if(remaining>0){bootTimer=setTimeout(resume,Math.min(remaining,2147483647));return;}bootTimer=null;void boot();};
-  bootTimer=setTimeout(resume,Math.min(wait,2147483647));
- }
+ app.innerHTML=`<div class='boot connection-state' data-connection-state='${signIn?'signin':waking?'waking':'unavailable'}'><span class='brand-mark'>л</span><h1>${heading}</h1><p>${message}</p>${signIn?`<a class='btn primary' href='/signin-with-chatgpt?return_to=%2F' target='_top'>Войти через ChatGPT</a>`:`<p class='connection-retry' role='status'>Нажимать «Повторить» не нужно.</p>${backendWakeUrl?`<button class='btn light' type='button' data-action='wake-server'>Открыть запуск сервера</button>`:''}`}</div>`;
+ scheduleBoot();
 }
 function startPolling(){
  if(pollTimer!==null)return;
@@ -284,13 +323,13 @@ function startPolling(){
   if(!server||!authenticated||polling||Date.now()<pollRetryAt||document.visibilityState!=='visible'||dialog.open||document.activeElement?.matches('input,select'))return;
   polling=true;
   try{await sync(page!=='account');}
-  catch(err){if(err.status===429){pollRetryAt=Date.now()+err.retryAfter;toast('Сервер запросил паузу. Обновление данных повторится позже.');}else toast(err.message);}
+  catch(err){if(err.status===429){pollRetryAt=Date.now()+err.retryAfter;toast('Сервер запросил паузу. Обновление данных повторится позже.');}else if(!err.status||[502,503,504].includes(err.status)){await reconnect();}else toast(err.message);}
   finally{polling=false;}
  },5000);
 }
 async function boot(){
- if(booting||Date.now()<bootRetryAt)return;
- clearTimeout(bootTimer);bootTimer=null;booting=true;
+ if(booting||Date.now()<bootRetryAt||document.visibilityState==='hidden')return;
+ clearTimeout(bootTimer);bootTimer=null;booting=true;connectionPending=true;
  app.innerHTML=`<div class='boot'><span class='brand-mark'>л</span><p>Подключаемся к рабочему серверу…</p></div>`;
  try{
   wakeBackendFromBrowser();
@@ -303,7 +342,7 @@ async function boot(){
    h=await response.json();
   }finally{clearTimeout(timeout);}
   // Preview is an explicit server mode, never a fallback for HTTP or network errors.
-  if(h?.service==='story-preview'){server=false;authenticated=false;bootRetries=0;bootRetryAt=0;render();return;}
+  if(h?.service==='story-preview'){server=false;authenticated=false;connectionPending=false;stopBackendWake();bootRetries=0;bootRetryAt=0;render();return;}
   if(h?.service!=='story-cloud'||h.ok!==true){connectionIssue('invalid');return;}
   server=true;
   if(h.ready===false){connectionIssue('waking');return;}
@@ -314,10 +353,10 @@ async function boot(){
    state=nextState;authenticated=true;
   }catch(err){
    authenticated=false;
-   if(err.status===401){render();showLogin();startPolling();return;}
+   if(err.status===401){connectionPending=false;stopBackendWake();render();showLogin();startPolling();return;}
    connectionIssue(err.status||0,err.status===429?err.retryAfter:undefined);return;
   }
-  bootRetries=0;bootRetryAt=0;pollRetryAt=0;
+  bootRetries=0;bootRetryAt=0;pollRetryAt=0;connectionPending=false;returnedFromWake=false;stopBackendWake();
   render();startPolling();
  }catch{connectionIssue(0);}
  finally{booting=false;}

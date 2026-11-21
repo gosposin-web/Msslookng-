@@ -128,7 +128,7 @@ test('Read-only health endpoint supports HEAD and rejects mutations',async()=>{
 test('Frontend receives only a public browser wake URL without credentials',async()=>{
  const e=env();e.BACKEND_URL='https://our-app.onrender.com';
  const r=await worker.fetch(request('/'),e),body=await r.text();
- assert.match(body,/name="story-backend-wake" content="https:\/\/our-app.onrender.com\/health"/);
+ assert.match(body,/name="story-backend-wake" content="https:\/\/our-app.onrender.com\/wake"/);
  assert.doesNotMatch(body,/a-test-secret|site-owner|credential/);
  for(const bad of ['http://our-app.onrender.com','https://user:password@our-app.onrender.com','https://evil.example']){
   e.BACKEND_URL=bad;const response=await worker.fetch(request('/'),e);

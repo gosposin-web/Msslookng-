@@ -51,10 +51,10 @@ function healthResponse(result,head=false){
 function frontendContent(asset,env){
  if(!asset.type.startsWith('text/html')||!env.BACKEND_URL)return asset.content;
  try{
-  const wake=new URL('/health',env.BACKEND_URL);
+  const wake=new URL('/wake',env.BACKEND_URL);
   if(wake.protocol!=='https:'||!wake.hostname.endsWith('.onrender.com')||wake.username||wake.password||wake.port)return asset.content;
-  // Public health URL only. This lets an active user's browser wake a sleeping
-  // free instance even if server-to-server traffic receives 429 before startup.
+  // Public readiness document only. Normal navigation can complete the hosting
+  // platform's cold-start page; a cross-origin opaque fetch cannot confirm it.
   return asset.content.replace('</head>',`<meta name="story-backend-wake" content="${wake.href}"></head>`);
  }catch{return asset.content;}
 }
