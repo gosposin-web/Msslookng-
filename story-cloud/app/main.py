@@ -25,6 +25,7 @@ from .worker import VIEW_LIMIT_24H, Worker
 from .snapshot import SnapshotStore, SnapshotError
 from .account_access import AccountAccessError, account_error
 from .avatar import MAX_PHOTO_UPLOAD, prepare_avatar
+from .diagnostics import import_diagnostic
 
 STATIC = Path(__file__).parent / 'static'
 COOKIE = 'story_cloud_session'
@@ -259,6 +260,7 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
             raise HTTPException(400,str(exc)) from None
         if len(passcode)>512 or len(password)>512:
             raise HTTPException(400,'Слишком длинный пароль.')
+        stage = 'archive_read'
         try:
             async with gateway.lock:
                 check_telegram_cooldown()
@@ -277,18 +279,21 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                             dst.write(chunk)
                     extracted=root/'tdata'
                     extracted.mkdir(mode=0o700)
+                    stage = 'archive_extract'
                     folder=await asyncio.to_thread(extract_tdata,archive,extracted)
                     async with asyncio.timeout(90):
+                        stage = 'gateway'
+                        gateway.import_stage = 'desktop_read'
                         await gateway.import_tdata(folder,api_id,api_hash,passcode,password)
         except HTTPException:
             raise
         except ArchiveError as exc:
             return error_response(AccountAccessError('TDATA_ARCHIVE_INVALID',str(exc),
-                                  'Загрузите ZIP с файлами авторизации вашего Telegram Desktop.'))
+                                  'Загрузите ZIP с файлами авторизации вашего Telegram Desktop.'),import_stage=stage)
         except SnapshotError as exc:
             raise HTTPException(503,str(exc)) from None
         except Exception as exc:
-            return error_response(exc)
+            return error_response(exc,import_stage=getattr(gateway,'import_stage','unknown') if stage=='gateway' else stage)
         finally:
             await file.close()
         return {'ok':True}
@@ -299,12 +304,16 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
             raise AccountAccessError('RATE_LIMIT','Telegram попросил подождать.',
                                      'Повторите после завершения паузы Telegram.',retry_after=wait['value']-now())
 
-    def error_response(exc):
+    def error_response(exc, *, import_stage=''):
         error = account_error(exc)
+        payload = error.payload()
+        if import_stage:
+            payload.update(import_diagnostic(exc,error.code,import_stage))
         if error.retry_after:
             db.execute("INSERT INTO runtime(key,value) VALUES('telegram_wait_until',?) ON CONFLICT(key) DO UPDATE SET value=MAX(value,excluded.value)",
                        (now()+error.retry_after,))
-        return JSONResponse(error.payload(),status_code=429 if error.retry_after else 400,
+        status = 429 if error.retry_after else 500 if error.code=='CLIENT_INTERNAL_ERROR' else 400
+        return JSONResponse(payload,status_code=status,
                             headers={'Retry-After':str(error.retry_after)} if error.retry_after else {})
 
     async def profile_action(operation, *, mutation=False):

@@ -48,7 +48,7 @@ async function api(path,options={}){
  const response=await fetch(path,{...requestOptions,headers,credentials:'same-origin'});
  let data;try{data=await response.json();}catch{const error=new Error(response.status===429?'Сервер попросил подождать.':'Сервер не вернул ожидаемый ответ. Повторите позже.');Object.assign(error,{status:response.status,retryAfter:retryDelay(response,30000)});throw error;}
  if(!data||typeof data!=='object')throw new Error('Сервер не вернул ожидаемый ответ. Повторите позже.');
- if(!response.ok){if(response.status===401&&server&&path!=='/api/auth/login'&&authPrompt){authenticated=false;showLogin();}const error=new Error(Array.isArray(data.detail)?'Проверьте значения полей.':data.detail||'Не удалось выполнить действие.');Object.assign(error,{status:response.status,code:data.code,hint:data.hint,appealUrl:data.appeal_url,freezeUntil:data.freeze_until,retryAfter:retryDelay(response,30000)});throw error;}
+ if(!response.ok){if(response.status===401&&server&&path!=='/api/auth/login'&&authPrompt){authenticated=false;showLogin();}const error=new Error(Array.isArray(data.detail)?'Проверьте значения полей.':data.detail||'Не удалось выполнить действие.');Object.assign(error,{status:response.status,code:data.code,hint:data.hint,appealUrl:data.appeal_url,freezeUntil:data.freeze_until,retryAfter:retryDelay(response,30000),diagnosticId:data.diagnostic_id,stageLabel:data.stage_label});throw error;}
  return data;
 }
 function nav(mobile=false){return Object.entries(labels).map(([key,label])=>`<button type='button' class='${mobile?'':'nav-btn '}${page===key?'active':''}' data-tab='${key}' ${page===key?"aria-current='page'":''}>${icon(navIcons[key])}<span>${label}</span>${!mobile&&key==='audience'&&state.stats.people?`<span class='nav-count'>${number(state.stats.people)}</span>`:''}</button>`).join('');}
@@ -92,10 +92,12 @@ function showError(el,err){
  if(!el)return;
  el.replaceChildren();
  const message=document.createElement('strong');message.textContent=err.message;el.append(message);
+ if(err.stageLabel){const stage=document.createElement('p');stage.textContent='Этап: '+err.stageLabel;el.append(stage);}
  if(err.hint){const hint=document.createElement('p');hint.textContent=err.hint;el.append(hint);}
  if(err.freezeUntil){const deadline=document.createElement('p');deadline.textContent='Telegram указал срок до возможного удаления аккаунта: '+new Intl.DateTimeFormat('ru-RU',{dateStyle:'medium',timeStyle:'short',timeZone:'Europe/Moscow'}).format(new Date(err.freezeUntil*1000))+' (МСК). Это не дата разморозки.';el.append(deadline);}
  if(err.appealUrl){try{const url=new URL(err.appealUrl);if(url.protocol==='https:'&&['telegram.org','www.telegram.org','t.me'].includes(url.hostname)){const link=document.createElement('a');link.href=url.href;link.textContent='Открыть апелляцию Telegram';link.target='_blank';link.rel='noopener noreferrer';el.append(link);}}catch{}}
  if(err.code){const code=document.createElement('small');code.textContent='Код: '+err.code;el.append(code);}
+ if(err.diagnosticId){const diagnostic=document.createElement('small');diagnostic.textContent='Диагностика: '+err.diagnosticId;el.append(diagnostic);}
 }
 function updateProfileHeader(){
  const a=state.account;if(!a)return;

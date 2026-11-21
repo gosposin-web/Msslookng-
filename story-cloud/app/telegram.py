@@ -36,6 +36,15 @@ def api_credentials(config,api_id=0,api_hash=''):
     return api_id,api_hash
 
 
+def create_cloud_client(session, api_id, api_hash, *, receive_updates):
+    # opentele patches Telethon's constructor globally and adds an `api` argument
+    # before api_id. Positional credentials silently turn api_hash into an int.
+    return TelegramClient(session,api_id=api_id,api_hash=api_hash,
+        device_model='Story Cloud',system_version='Cloud Linux',app_version='1.0',
+        receive_updates=receive_updates,flood_sleep_threshold=0,request_retries=0,
+        connection_retries=1,retry_delay=1,timeout=10)
+
+
 async def authorize_cloud(desktop_client, cloud_client, password):
     qr = await cloud_client.qr_login()
     # QRLogin.wait must be running before the Desktop session accepts the token.
@@ -130,11 +139,9 @@ class TelegramGateway:
         if not account:
             raise TelegramError('Сначала подключите аккаунт.')
         d = json.loads(self.cipher.decrypt(account['credential']))
-        self.client = TelegramClient(
+        self.client = create_cloud_client(
             StringSession(d['session']), d['api_id'], d['api_hash'],
-            device_model='Story Cloud', system_version='Cloud Linux', app_version='1.0',
-            receive_updates=False, flood_sleep_threshold=0, request_retries=0,
-            connection_retries=1, retry_delay=1, timeout=10)
+            receive_updates=False)
         await self.client.connect()
         try:
             await inspect_account(self.client)
@@ -148,6 +155,7 @@ class TelegramGateway:
         # Import only in this path: opentele extends Telethon globally.
         from opentele.td import TDesktop
         from opentele.api import UseCurrentSession
+        self.import_stage = 'desktop_read'
         desktop = await asyncio.to_thread(TDesktop, str(folder), passcode=passcode)
         if not desktop.isLoaded() or not desktop.mainAccount:
             raise AccountAccessError('TDATA_INVALID','В tdata не найден активный аккаунт.',
@@ -158,20 +166,25 @@ class TelegramGateway:
         try:
             # Use the Desktop authorization only to accept a fresh, separate cloud login.
             # Manage both clients explicitly: opentele's QR helper leaks clients on errors.
+            self.import_stage = 'desktop_session'
             desktop_client = await desktop.ToTelethon(flag=UseCurrentSession,
                 receive_updates=False, flood_sleep_threshold=0, request_retries=0,
                 connection_retries=1, timeout=10)
+            self.import_stage = 'desktop_connect'
             await desktop_client.connect()
+            self.import_stage = 'desktop_check'
             original = await inspect_account(desktop_client)
-            client = TelegramClient(StringSession(),api_id,api_hash,
-                device_model='Story Cloud',system_version='Cloud Linux',app_version='1.0',
-                receive_updates=True,flood_sleep_threshold=0,request_retries=0,
-                connection_retries=1,timeout=10)
+            self.import_stage = 'cloud_session'
+            client = create_cloud_client(StringSession(),api_id,api_hash,receive_updates=True)
+            self.import_stage = 'cloud_connect'
             await client.connect()
+            self.import_stage = 'cloud_login'
             await authorize_cloud(desktop_client,client,password)
+            self.import_stage = 'cloud_check'
             me = await inspect_account(client)
             if me.id != original.id:
                 raise AccountAccessError('ACCOUNT_MISMATCH','Telegram вернул другой аккаунт. Импорт отменён.')
+            self.import_stage = 'save'
             credential = self.cipher.encrypt(json.dumps({
                 'session':StringSession.save(client.session),'api_id':api_id,'api_hash':api_hash
             }).encode())
@@ -184,6 +197,7 @@ class TelegramGateway:
                 c.execute('INSERT INTO events(level,message,created_at) VALUES(?,?,?)',
                           ('info','Аккаунт подключён. Создана отдельная облачная сессия.',now()))
             persisted = True
+            self.import_stage = 'done'
         except BaseException:
             # Revoke a newly created cloud authorization if it could not be persisted.
             if client and not persisted:

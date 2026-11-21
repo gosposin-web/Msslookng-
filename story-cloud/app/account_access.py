@@ -2,7 +2,7 @@
 import re
 from urllib.parse import urlsplit
 
-from telethon import functions, types
+from telethon import functions, types, errors
 
 
 class AccountAccessError(ValueError):
@@ -111,6 +111,9 @@ def account_error(exc):
         'PhotoExtInvalidError':('PHOTO_INVALID','Telegram не принимает формат фотографии.','Выберите другое фото JPG, PNG или WebP.'),
         'PhotoCropSizeSmallError':('PHOTO_TOO_SMALL','Фотография слишком маленькая для Telegram.','Выберите изображение размером не менее 160 × 160 пикселей.'),
         'ImageProcessFailedError':('PHOTO_INVALID','Telegram не смог обработать изображение.','Выберите другую фотографию.'),
+        'AuthTokenExpiredError':('LOGIN_TOKEN_EXPIRED','Истёк срок подтверждения облачного входа.','Повторите импорт: приложение создаст новый запрос входа.'),
+        'AuthTokenInvalidError':('LOGIN_TOKEN_INVALID','Telegram отклонил подтверждение облачного входа.','Повторите импорт позже. Если ошибка сохранится, проверьте исходную сессию в Desktop.'),
+        'AuthTokenAlreadyAcceptedError':('LOGIN_TOKEN_USED','Подтверждение входа уже было использовано.','Проверьте устройства в Telegram перед повторной попыткой.'),
     }
     if name in mapping:
         return AccountAccessError(*mapping[name])
@@ -138,6 +141,9 @@ def account_error(exc):
     # Only our own validation messages are safe to display verbatim.
     if name == 'TelegramError':
         return AccountAccessError('VALIDATION_ERROR', str(exc))
+    if not isinstance(exc, errors.RPCError):
+        return AccountAccessError('CLIENT_INTERNAL_ERROR','Не удалось завершить действие из-за технической ошибки приложения.',
+                                  'Этот сбой не подтверждает блокировку или заморозку аккаунта. Сообщите код диагностики, если ошибка повторится.')
     rpc = getattr(exc, 'message', '')
     code = rpc if isinstance(rpc, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{2,70}', rpc) else 'TELEGRAM_ERROR'
     return AccountAccessError(code,'Telegram не подтвердил действие.',

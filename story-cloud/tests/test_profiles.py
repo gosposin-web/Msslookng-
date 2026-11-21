@@ -184,12 +184,44 @@ async def test_frozen_check_reads_actual_tl_json_and_does_not_infer_from_restric
     (errors.UserDeactivatedError(None),'ACCOUNT_DELETED'),
     (errors.PasswordHashInvalidError(None),'TWO_FACTOR_INVALID'),
     (TimeoutError('secret session data'),'CONNECTION_FAILED'),
-    (RuntimeError('secret session data'),'TELEGRAM_ERROR'),
+    (RuntimeError('secret session data'),'CLIENT_INTERNAL_ERROR'),
 ])
 def test_diagnostics_distinguish_account_states_and_hide_payloads(exc,code):
     error = account_error(exc)
     assert error.code == code
     assert 'secret session data' not in str(error.payload())
+
+
+def test_internal_import_error_has_phase_and_private_diagnostic_id(panel,monkeypatch,caplog):
+    import json
+    import re
+    client,app,protocol=panel
+    app.state.db.execute('DELETE FROM account')
+    async def fail(folder,api_id,api_hash,passcode,password):
+        app.state.gateway.import_stage='cloud_login'
+        raise TypeError('private-session-value '+passcode+' '+password+' '+api_hash)
+    monkeypatch.setattr(app.state.gateway,'import_tdata',fail)
+    result=client.post('/api/account/tdata',data={'api_id':'123456','api_hash':'a'*32,
+                        'passcode':'private-desktop-password','password':'private-cloud-password'},
+                        files={'file':('private-archive-name.zip',make_zip({'tdata/key_datas':b'key','tdata/D877F783D5D3EF8Cs':b'account'}))})
+    assert result.status_code==500
+    data=result.json()
+    assert data['code']=='CLIENT_INTERNAL_ERROR'
+    assert data['stage']=='cloud_login' and data['stage_label']=='Подтверждение нового входа'
+    assert re.fullmatch(r'[a-f0-9]{12}',data['diagnostic_id'])
+    assert 'diagnostic='+data['diagnostic_id'] in caplog.text
+    assert 'exception=TypeError' in caplog.text
+    for secret in ('private-session-value','private-desktop-password','private-cloud-password','private-archive-name','a'*32):
+        assert secret not in caplog.text
+        assert secret not in json.dumps(data)
+    assert app.state.db.account() is None
+
+
+def test_unknown_rpc_error_stays_separate_from_internal_application_errors():
+    error=account_error(errors.RPCError(None,'UNRECOGNIZED_ERROR',400))
+    assert error.code=='UNRECOGNIZED_ERROR'
+    assert 'Telegram' in str(error)
+    assert account_error(TypeError('private session')).code=='CLIENT_INTERNAL_ERROR'
 
 
 @pytest.mark.parametrize('condition',['frozen','revoked','banned'])
