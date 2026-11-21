@@ -49,7 +49,7 @@ test('Service readiness returns metadata without credentials or account data',as
  const e=env();e.BACKEND_URL='https://backend.test';
  e.BUCKET.head=async()=>({size:4096});
  const previous=globalThis.fetch;
- globalThis.fetch=async()=>Response.json({ok:true,ready:true,mode:'free'});
+ globalThis.fetch=async()=>Response.json({ok:true,service:'story-cloud',ready:true,mode:'free'});
  try{
   const r=await worker.fetch(new Request('https://private.test/service-health'),e);
   assert.deepEqual(await r.json(),{ready:true,mode:'free',checkpoint_saved:true,checkpoint_bytes:4096});
@@ -63,5 +63,65 @@ test('Avatar cache validation stays private and forwards only the photo ETag',as
   const r=await worker.fetch(request('/api/account/profile/photo?v=revision','GET',{'oai-authenticated-user-id':'owner','If-None-Match':'"revision"','Cookie':'private-session'}),e);
   assert.equal(r.status,304);assert.equal(r.headers.get('cache-control'),'private, max-age=300');
   assert.equal(forwarded.get('if-none-match'),'"revision"');assert.equal(forwarded.get('cookie'),null);
+ }finally{globalThis.fetch=previous;}
+});
+test('Health checks send no visitor or bridge credentials upstream',async()=>{
+ const e=env();e.BACKEND_URL='https://health-privacy.test';
+ const previous=globalThis.fetch;let observed;
+ globalThis.fetch=async(url,options)=>{observed={url,...options};return Response.json({ok:true,service:'story-cloud',ready:true,mode:'free'});};
+ try{
+  const r=await worker.fetch(request('/health','GET',{'Cookie':'private','Authorization':'Bearer private','OAI-Sites-Authorization':'Bearer private','oai-authenticated-user-id':'owner'}),e);
+  assert.equal(r.status,200);
+  assert.deepEqual(observed.headers,{Accept:'application/json'});
+  assert.equal(observed.redirect,'manual');
+  assert.equal(r.headers.get('cache-control'),'no-store');
+  assert.equal((await worker.fetch(request('/api/state'),e)).status,401);
+ }finally{globalThis.fetch=previous;}
+});
+test('Concurrent startup probes share one request and briefly reuse a healthy result',async()=>{
+ const e=env();e.BACKEND_URL='https://health-coalescing.test';
+ const previous=globalThis.fetch;let calls=0,release;
+ globalThis.fetch=async()=>{calls++;return new Promise(resolve=>{release=resolve;});};
+ try{
+  const pending=Array.from({length:3},()=>worker.fetch(request('/health'),e));
+  assert.equal(calls,1);
+  release(Response.json({ok:true,service:'story-cloud',ready:true}));
+  const results=await Promise.all(pending);assert(results.every(r=>r.status===200));
+  assert.equal((await worker.fetch(request('/health'),e)).status,200);
+  assert.equal(calls,1);
+ }finally{globalThis.fetch=previous;}
+});
+test('Hosting 429 preserves Retry-After and prevents another upstream probe during the pause',async()=>{
+ const e=env();e.BACKEND_URL='https://health-rate-limit.test';e.BUCKET.head=async()=>({size:4096});
+ const previous=globalThis.fetch;let calls=0;
+ globalThis.fetch=async()=>{calls++;return new Response('<html>rate limited</html>',{status:429,headers:{'Retry-After':'120'}});};
+ try{
+  const r=await worker.fetch(request('/health'),e);assert.equal(r.status,429);
+  assert.equal(r.headers.get('retry-after'),'120');
+  assert.equal((await r.json()).reason,'hosting_rate_limit');
+  assert.equal((await worker.fetch(request('/health'),e)).status,429);
+  const diagnostic=await worker.fetch(request('/service-health'),e),data=await diagnostic.json();
+  assert.equal(data.upstream_status,429);assert.equal(data.checkpoint_saved,true);assert.equal(data.ready,false);
+  assert.equal(calls,1);
+ }finally{globalThis.fetch=previous;}
+});
+test('Unexpected health responses and failures never become preview mode',async()=>{
+ const previous=globalThis.fetch;
+ try{
+  for(const [name,response] of [['html',new Response('<html>startup</html>')],['json',Response.json({ok:true})]]){
+   const e=env();e.BACKEND_URL='https://health-'+name+'.test';
+   globalThis.fetch=async()=>response;
+   const r=await worker.fetch(request('/health'),e);assert.equal(r.status,503);
+   const data=await r.json();assert.equal(data.service,'story-cloud');assert.equal(data.ready,false);
+  }
+ }finally{globalThis.fetch=previous;}
+});
+test('Read-only health endpoint supports HEAD and rejects mutations',async()=>{
+ const e=env();e.BACKEND_URL='https://health-methods.test';
+ const previous=globalThis.fetch;
+ globalThis.fetch=async()=>Response.json({ok:true,service:'story-cloud',ready:true});
+ try{
+  const head=await worker.fetch(request('/health','HEAD'),e);assert.equal(head.status,200);assert.equal(await head.text(),'');
+  const post=await worker.fetch(request('/health','POST'),e);assert.equal(post.status,405);
  }finally{globalThis.fetch=previous;}
 });
