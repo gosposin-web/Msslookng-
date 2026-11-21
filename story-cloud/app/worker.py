@@ -6,7 +6,7 @@ import sqlite3
 from telethon.errors import FloodWaitError
 
 from .db import now
-from .telegram import friendly_error
+from .telegram import friendly_error, PersonLookupError, TelegramError
 from .snapshot import SnapshotError
 from .account_access import account_error
 
@@ -78,7 +78,10 @@ class Worker:
                     await self.storage.flush()
                 self.ensure_snapshot(job)
                 async with asyncio.timeout(45):
-                    delay = await (self.scan(job) if job['kind']=='scan' else self.view(job))
+                    action = {'scan':self.scan,'view':self.view,'people_import':self.import_people}.get(job['kind'])
+                    if not action:
+                        raise TelegramError('Неизвестный тип задания. Обновите приложение.')
+                    delay = await action(job)
             self.db.requeue(job_id,delay=delay)
             if self.storage:
                 await self.storage.flush()
@@ -162,6 +165,70 @@ class Worker:
             c.execute('UPDATE job_people SET checked=1 WHERE job_id=? AND user_id=?',(job['id'],person['user_id']))
             c.execute('UPDATE jobs SET checked=checked+1,found=found+?,message=?,updated_at=? WHERE id=?',
                       (int(bool(stories)),'Проверяем доступные активные истории.',now(),job['id']))
+        return 3
+
+    async def import_people(self, job):
+        p = job['payload']
+        position = p.get('position', 0)
+        if position >= len(p['refs']):
+            self.db.update_job(job['id'], status='done', message=f'Пользователей: {job["collected"]}; с историями: {job["found"]}; пропущено: {p["rejected"]}.')
+            return 0
+        ref = p['refs'][position]
+        if p.get('phase', 'resolve') == 'resolve':
+            try:
+                person = await self.gateway.resolve_person(ref)
+            except PersonLookupError as exc:
+                self.ensure_snapshot(job)
+                if not self.db.running(job['id']):
+                    return 0
+                p['position'] = position + 1
+                p['rejected'] += 1
+                if len(p['errors']) < 20:
+                    p['errors'].append({'ref':ref,'message':str(exc)})
+                self.db.update_job(job['id'],payload=p,retries=0,message=f'{ref}: {exc}')
+                return 3
+            self.ensure_snapshot(job)
+            if not self.db.running(job['id']):
+                return 0
+            # Identity and cursor are committed together. A restart cannot count a
+            # resolved username twice or lose the target before its story check.
+            with self.db.connect() as c:
+                duplicate = c.execute('SELECT user_id FROM job_people WHERE job_id=? AND user_id=?',
+                                      (job['id'],person['user_id'])).fetchone()
+                if duplicate:
+                    p['duplicate_users'] += 1
+                    p['position'] = position + 1
+                    message = 'Повтор того же пользователя пропущен.'
+                else:
+                    existing = c.execute('SELECT user_id FROM people WHERE user_id=?',(person['user_id'],)).fetchone()
+                    c.execute('''INSERT INTO people(user_id,name,username,peer,created_at) VALUES(?,?,?,?,?)
+                                 ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,username=excluded.username,peer=excluded.peer''',
+                              (person['user_id'],person['name'],person.get('username'),person['peer'],now()))
+                    c.execute('INSERT INTO job_people(job_id,user_id) VALUES(?,?)',(job['id'],person['user_id']))
+                    p['added'] += int(not existing)
+                    p['phase'] = 'check'
+                    p['user_id'] = person['user_id']
+                    message = 'Пользователь добавлен. Проверяем доступные истории.'
+                c.execute('UPDATE jobs SET payload=?,collected=collected+?,message=?,retries=0,updated_at=? WHERE id=?',
+                          (json.dumps(p),int(not duplicate),message,now(),job['id']))
+            return 3
+        person = self.db.one('SELECT * FROM people WHERE user_id=?',(p['user_id'],))
+        if not person:
+            raise TelegramError('Пользователь удалён из базы. Добавьте его заново.')
+        stories = await self.gateway.stories(person)
+        self.ensure_snapshot(job)
+        if not self.db.running(job['id']):
+            return 0
+        p['position'] = position + 1
+        p['phase'] = 'resolve'
+        p.pop('user_id', None)
+        with self.db.connect() as c:
+            c.execute('UPDATE people SET stories=?,checked_at=? WHERE user_id=?',
+                      (json.dumps(stories),now(),person['user_id']))
+            c.execute('UPDATE job_people SET checked=1 WHERE job_id=? AND user_id=?',
+                      (job['id'],person['user_id']))
+            c.execute('UPDATE jobs SET payload=?,checked=checked+1,found=found+?,message=?,retries=0,updated_at=? WHERE id=?',
+                      (json.dumps(p),int(bool(stories)),'Проверяем пользователей из списка.',now(),job['id']))
         return 3
 
     async def view(self, job):

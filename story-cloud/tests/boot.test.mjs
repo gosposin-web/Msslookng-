@@ -14,13 +14,14 @@ const json=(data,status=200,headers={})=>Response.json(data,{status,headers});
 async function harness(responder,wakeUrl=''){
  let clock=Date.now(),id=0;
  const timers=new Map(),intervals=new Map(),handlers={},requests=[];
- const el=()=>({innerHTML:'',textContent:'',dataset:{},open:false,classList:{add(){},remove(){}},addEventListener(){},showModal(){this.open=true;},close(){this.open=false;}});
- const elements={'#app':el(),'#dialog':el(),'#toast':el()};
+ const el=()=>({innerHTML:'',textContent:'',dataset:{},open:false,isConnected:true,classList:{add(){},remove(){}},replaceChildren(...children){this.innerHTML='';this.textContent=children.map(c=>c.textContent).join('');},append(child){this.textContent+=child.textContent;},addEventListener(){},showModal(){this.open=true;},close(){this.open=false;}});
+ const elements={'#app':el(),'#dialog':el(),'#toast':el(),'#people-add-error':el(),'#people-file-error':el()};
  if(wakeUrl)elements['meta[name="story-backend-wake"]']={content:wakeUrl};
- const document={querySelector:selector=>elements[selector]||null,querySelectorAll:()=>[],visibilityState:'visible',activeElement:null,
+ const document={querySelector:selector=>elements[selector]||null,getElementById:id=>elements['#'+id]||null,createElement:()=>el(),querySelectorAll:()=>[],visibilityState:'visible',activeElement:null,
   addEventListener(type,handler){(handlers[type]??=[]).push(handler);}};
  class ClockDate extends Date{static now(){return clock;}}
- const context=vm.createContext({console,document,window:{scrollTo(){}},Date:ClockDate,Intl,Set,URL,URLSearchParams,FormData,AbortController,crypto:webcrypto,
+ class BrowserFormData extends FormData{constructor(form){super();for(const [name,value] of Object.entries(form?.fields||{}))this.append(name,value);}}
+ const context=vm.createContext({console,document,window:{scrollTo(){}},Date:ClockDate,Intl,Set,URL,URLSearchParams,FormData:BrowserFormData,AbortController,crypto:webcrypto,
   fetch:async(path,options)=>{requests.push({path,options});return responder(path,requests.length,options);},
   setTimeout(fn,delay){const next=++id;timers.set(next,{fn,delay});return next;},clearTimeout(key){timers.delete(key);},
   setInterval(fn,delay){const next=++id;intervals.set(next,{fn,delay});return next;},clearInterval(key){intervals.delete(key);}});
@@ -31,6 +32,7 @@ async function harness(responder,wakeUrl=''){
   async retry(){const entry=[...timers.entries()].find(([,t])=>t.delay!==6500);assert(entry,'Expected a scheduled retry');const [key,timer]=entry;timers.delete(key);clock+=timer.delay;await timer.fn();await settle();},
   async clickRetry(){const target={dataset:{action:'retry-boot'},disabled:false,isConnected:true};for(const handler of handlers.click||[])await handler({target:{closest:()=>target},preventDefault(){}});await settle();},
   async clickAction(action){const target={dataset:{action},disabled:false,isConnected:true};for(const handler of handlers.click||[])await handler({target:{closest:()=>target},preventDefault(){}});await settle();},
+  async submitForm(id,fields){const submit={innerHTML:'Добавить',textContent:'Добавить',isConnected:true},fieldset={disabled:false};const form={id,fields,matches:()=>false,querySelector:selector=>selector==='fieldset'?fieldset:submit};for(const handler of handlers.submit||[])await handler({target:form,preventDefault(){}});await settle();return {submit,fieldset};},
   advance(ms){clock+=ms;},
   async poll(){assert.equal(intervals.size,1);await [...intervals.values()][0].fn();},
  };
@@ -184,4 +186,69 @@ test('Browser wake cannot send requests to arbitrary or credential-bearing URLs'
   const h=await harness(normal,wake);
   assert.equal(h.requests.some(r=>String(r.path).startsWith('http')),false);
  }
+});
+
+test('Audience offers username entry, phone file upload and a manual audience filter',async()=>{
+ const h=await harness(normal);
+ vm.runInContext("state.account={name:'Test user'};page='audience';render()",h.context);
+ const html=h.elements['#app'].innerHTML;
+ assert.match(html,/id='people-add-form'/);
+ assert.match(html,/name='username' placeholder='@username'/);
+ assert.match(html,/data-action='import-people'/);
+ assert.match(html,/Добавленные по юзернейму/);
+ await h.clickAction('import-people');
+ const dialog=h.elements['#dialog'].innerHTML;
+ assert.match(dialog,/до 200 уникальных пользователей/);
+ assert.match(dialog,/accept='.txt,.csv,text\/plain,text\/csv'/);
+ assert.match(dialog,/name='request_id' value='[a-f0-9-]{36}'/);
+ assert.match(dialog,/Просмотр историй запускается отдельно/);
+});
+
+test('Single username posts with CSRF and opens all audience including users without stories',async()=>{
+ const h=await harness(path=>{
+  if(path==='/api/people')return json({ok:true,valid:1,job_id:'users-job'});
+  if(path.startsWith('/api/people?'))return json({people:[],total:0});
+  return normal(path);
+ });
+ vm.runInContext("state.account={name:'Test user'};activeOnly=true;source='old-chat';search='old search'",h.context);
+ await h.submitForm('people-add-form',{username:'@user_one',request_id:'stable-request-id'});
+ const request=h.requests.find(r=>r.path==='/api/people');
+ assert.equal(request.options.method,'POST');
+ assert.equal(request.options.headers['X-CSRF-Token'],'test-csrf');
+ assert.deepEqual(JSON.parse(request.options.body),{username:'@user_one',request_id:'stable-request-id'});
+ const query=h.requests.find(r=>r.path.startsWith('/api/people?')).path;
+ assert.equal(new URLSearchParams(query.split('?')[1]).get('active'),'false');
+ assert.equal(new URLSearchParams(query.split('?')[1]).get('source'),'');
+ assert.match(h.elements['#app'].innerHTML,/Аудитория/);
+});
+
+test('User file submission retains retry identity and shows accepted plus rejected rows',async()=>{
+ let attempts=0;
+ const h=await harness(path=>{
+  if(path==='/api/people/import')return ++attempts===1?json({detail:'Временно недоступно.'},503):json({valid:2,duplicates:1,invalid_count:1,invalid_rows:[{line:4,value:'<svg onload=alert(1)>',message:'Неверный username'}],replayed:true});
+  if(path.startsWith('/api/people?'))return json({people:[],total:0});
+  return normal(path);
+ });
+ const fields={request_id:'stable-user-upload-id',file:new Blob(['@user_one\n@user_two'])};
+ const first=await h.submitForm('people-file-form',fields);
+ assert.equal(first.fieldset.disabled,false);
+ assert.match(h.elements['#people-file-error'].innerHTML||h.elements['#people-file-error'].textContent,/Временно недоступно/);
+ await h.submitForm('people-file-form',fields);
+ const requests=h.requests.filter(r=>r.path==='/api/people/import');
+ assert.equal(requests.length,2);
+ assert(requests.every(r=>r.options.body.get('request_id')==='stable-user-upload-id'));
+ assert(requests.every(r=>!r.options.headers['Content-Type']),'Browser must add the multipart boundary');
+ const html=h.elements['#dialog'].innerHTML;
+ assert.match(html,/Юзернеймов на проверку: 2/);
+ assert.match(html,/Повторное задание не создано/);
+ assert.match(html,/&lt;svg/);assert.doesNotMatch(html,/<svg onload/);
+});
+
+test('User import queue shows its progress and escaped per-user failures',async()=>{
+ const h=await harness(normal);
+ const html=vm.runInContext(`jobCard({id:'import-job',kind:'people_import',status:'paused',total:200,processed:40,collected:32,checked:32,found:12,added:20,rejected:7,duplicate_users:1,created_at:1800000000,import_errors:[{ref:'@missing_user',message:'<script>bad</script>'}]})`,h.context);
+ assert.match(html,/Добавление пользователей/);assert.match(html,/Обработано 40 из 200/);
+ assert.match(html,/С историями: 12/);assert.match(html,/width:20%/);
+ assert.match(html,/Причины пропуска \(7\)/);assert.match(html,/&lt;script&gt;/);
+ assert.doesNotMatch(html,/<script>/);assert.match(html,/data-action='job-resume'/);
 });

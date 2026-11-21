@@ -74,6 +74,9 @@ class DB:
                     import_id TEXT NOT NULL REFERENCES source_imports(id) ON DELETE CASCADE,
                     job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
                     PRIMARY KEY(import_id,job_id));
+                CREATE TABLE IF NOT EXISTS people_imports (
+                    id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL,
+                    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, created_at INTEGER NOT NULL);
                 CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(status,next_run,created_at);
                 CREATE INDEX IF NOT EXISTS jobs_source_created ON jobs(source_id,created_at);
                 CREATE INDEX IF NOT EXISTS job_people_unchecked ON job_people(job_id,checked,user_id);
@@ -178,7 +181,7 @@ class DB:
     def recover(self):
         # A view RPC might have succeeded before a crash. Do not silently repeat it.
         self.execute("UPDATE jobs SET status='paused',message='Сервер перезапущен. Проверьте результат и продолжите вручную.',updated_at=? WHERE status='running' AND kind='view'", (now(),))
-        self.execute("UPDATE jobs SET status='queued',updated_at=? WHERE status='running' AND kind='scan'", (now(),))
+        self.execute("UPDATE jobs SET status='queued',updated_at=? WHERE status='running' AND kind IN ('scan','people_import')", (now(),))
 
     def public_job(self, row):
         return {k: v for k,v in row.items() if k != 'payload'}

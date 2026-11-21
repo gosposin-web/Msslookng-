@@ -28,6 +28,8 @@ from .avatar import MAX_PHOTO_UPLOAD, prepare_avatar
 from .diagnostics import import_diagnostic
 from .chat_files import MAX_CHAT_FILE, ChatFileError, parse_chat_file
 from .source_store import SourceStoreError, add_source as store_source, import_sources, control_import, start_scan
+from .people_imports import (MAX_PEOPLE_FILE, PeopleImportError, PeopleList,
+                             normalize_person, parse_people_file, queue_people)
 
 STATIC = Path(__file__).parent / 'static'
 COOKIE = 'story_cloud_session'
@@ -41,7 +43,7 @@ class BodyLimitMiddleware:
         if scope['type']!='http':
             return await self.app(scope,receive,send)
         limit = (MAX_UPLOAD+128*1024 if scope['path']=='/api/account/tdata' else
-                 MAX_CHAT_FILE+64*1024 if scope['path']=='/api/sources/import' else
+                 MAX_CHAT_FILE+64*1024 if scope['path'] in ('/api/sources/import','/api/people/import') else
                  MAX_PHOTO_UPLOAD+64*1024 if scope['path']=='/api/account/profile/photo' else 128*1024)
         headers=dict(scope.get('headers',[]))
         try:
@@ -88,6 +90,11 @@ class SourceInput(BaseModel):
 class ViewInput(BaseModel):
     user_ids: list[str] = Field(min_length=1,max_length=500)
     delay: int = Field(default=15,ge=5,le=300)
+
+
+class PersonInput(BaseModel):
+    username: str = Field(min_length=1, max_length=200)
+    request_id: str = Field(default='', max_length=80)
 
 
 class ControlInput(BaseModel):
@@ -238,8 +245,13 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
         jobs=[]
         for row in db.all("SELECT * FROM jobs ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'waiting' THEN 1 WHEN 'queued' THEN 2 WHEN 'paused' THEN 3 ELSE 4 END,created_at DESC,rowid DESC LIMIT 600"):
             p=json.loads(row['payload'])
-            jobs.append(db.public_job(row)|{'total':len(p.get('user_ids',[])) if row['kind']=='view' else row['collected'],
-                                           'phase':p.get('phase','gather')})
+            item = db.public_job(row)|{'total':len(p.get('user_ids',[])) if row['kind']=='view' else row['collected'],
+                                       'phase':p.get('phase','gather')}
+            if row['kind']=='people_import':
+                item.update(total=len(p.get('refs',[])), processed=p.get('position',0),
+                            added=p.get('added',0), rejected=p.get('rejected',0),
+                            duplicate_users=p.get('duplicate_users',0), import_errors=p.get('errors',[])[:20])
+            jobs.append(item)
         cooldown=db.one("SELECT value FROM runtime WHERE key='telegram_wait_until'")
         job_counts={r['status']:r['n'] for r in db.all('SELECT status,COUNT(*) n FROM jobs GROUP BY status')}
         imports=db.all('''SELECT i.id,i.created_at,COUNT(j.id) total,
@@ -409,6 +421,7 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                 c.execute('DELETE FROM view_attempts')
                 c.execute('DELETE FROM runtime')
                 c.execute('DELETE FROM source_imports')
+                c.execute('DELETE FROM people_imports')
             db.event('Аккаунт отключён. Локальные данные сессии и аудитории удалены.')
         return {'ok':True,'revoked':revoked,'message':('Облачная сессия завершена.' if revoked else 'Данные удалены. Завершите сессию Story Cloud в настройках Telegram, если она осталась активной.')}
 
@@ -467,11 +480,36 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
         except SourceStoreError as exc:
             raise HTTPException(exc.status,str(exc)) from None
 
+    @app.post('/api/people')
+    def add_person(body: PersonInput,login=Depends(authenticated)):
+        try:
+            ref=normalize_person(body.username)
+            return queue_people(db,PeopleList([ref],0,[],0),ref.encode(),body.request_id or uuid.uuid4().hex)
+        except PeopleImportError as exc:
+            raise HTTPException(exc.status,str(exc)) from None
+
+    @app.post('/api/people/import')
+    async def import_people(file: UploadFile=File(...),request_id: str=Form(''),login=Depends(authenticated)):
+        try:
+            data=await file.read(MAX_PEOPLE_FILE+1)
+            parsed=await asyncio.to_thread(parse_people_file,data,file.filename or '')
+            if storage:
+                await storage.flush()
+            return queue_people(db,parsed,data,request_id or uuid.uuid4().hex)
+        except PeopleImportError as exc:
+            raise HTTPException(exc.status,str(exc)) from None
+        except SnapshotError as exc:
+            raise HTTPException(503,str(exc)) from None
+        finally:
+            await file.close()
+
     def people_query(search='',source='',active=False):
         sql='SELECT DISTINCT p.* FROM people p'
         args=[]
         filters=[]
-        if source:
+        if source=='manual':
+            filters.append("EXISTS(SELECT 1 FROM job_people jp JOIN jobs j ON j.id=jp.job_id WHERE jp.user_id=p.user_id AND j.kind='people_import')")
+        elif source:
             sql+=' JOIN source_people sp ON sp.user_id=p.user_id'
             filters.append('sp.source_id=?')
             args.append(source)

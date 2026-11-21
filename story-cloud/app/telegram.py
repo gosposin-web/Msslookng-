@@ -20,6 +20,11 @@ class TelegramError(ValueError):
     pass
 
 
+class PersonLookupError(TelegramError):
+    """A problem with one target, not the connected account or transport."""
+    pass
+
+
 def api_credentials(config,api_id=0,api_hash=''):
     """Resolve complete pairs atomically; never mix a custom ID with a public hash."""
     if api_id or api_hash:
@@ -320,6 +325,26 @@ class TelegramGateway:
             return None
         return {'user_id':str(user.id),'name':display_name(user),'username':user.username,
                 'peer':self.cipher.encrypt(json.dumps({'id':user.id,'hash':user.access_hash}).encode())}
+
+    async def resolve_person(self, ref):
+        client = await self.client_for_account()
+        try:
+            user = await client.get_entity(ref)
+        except (errors.UsernameInvalidError, errors.UsernameNotOccupiedError,
+                errors.PeerIdInvalidError, errors.UserIdInvalidError, ValueError):
+            raise PersonLookupError('Пользователь с таким юзернеймом не найден.') from None
+        if not isinstance(user, types.User):
+            raise PersonLookupError('Этот юзернейм принадлежит чату или каналу, а не пользователю.')
+        if user.bot:
+            raise PersonLookupError('Это бот. Добавлять можно обычных пользователей.')
+        if user.deleted:
+            raise PersonLookupError('Этот аккаунт удалён.')
+        if user.is_self:
+            raise PersonLookupError('Это ваш подключённый аккаунт.')
+        person = self.person(user)
+        if not person:
+            raise PersonLookupError('Telegram не предоставил доступ к этому пользователю.')
+        return person
 
     async def gather(self, ref, mode, cursor, remaining):
         client = await self.client_for_account()
