@@ -245,17 +245,31 @@ class TelegramGateway:
                           (photo, photo_id or '', uuid.uuid4().hex))
         return self.db.public_account()
 
+    async def cache_full_profile(self, client, me):
+        full=await client(functions.users.GetFullUserRequest(types.InputUserSelf()))
+        value=full.full_user
+        channel_id=str(getattr(value,'personal_channel_id',None) or '')
+        channel=next((c for c in getattr(full,'chats',[]) if str(c.id)==channel_id),None)
+        self.db.execute('UPDATE account_profile SET about=?,is_premium=?,personal_channel_id=?,personal_channel_title=?,personal_channel_username=? WHERE id=1',
+            (getattr(value,'about','') or '',int(bool(getattr(me,'premium',False))),channel_id,
+             getattr(channel,'title','') or '',getattr(channel,'username','') or ''))
+        return self.db.public_account()
+
     async def read_profile(self):
         client = await self.client_for_account()
         me = await inspect_account(client)
+        self.cache_profile(me)
+        await self.cache_full_profile(client,me)
         photo_id = str(getattr(getattr(me,'photo',None),'photo_id','') or '')
         saved = self.db.one('SELECT photo_id,photo IS NOT NULL AS has_photo FROM account_profile WHERE id=1')
         if not saved or saved['photo_id'] != photo_id or (photo_id and not saved['has_photo']):
             photo = await client.download_profile_photo(me, file=bytes, download_big=False) if photo_id else None
             if photo is not None and len(photo) > 5*1024*1024:
                 raise AccountAccessError('PHOTO_SIZE','Telegram вернул слишком большую фотографию профиля.')
-            return self.cache_profile(me, photo, replace_photo=True, photo_id=photo_id)
-        return self.cache_profile(me)
+            self.cache_profile(me, photo, replace_photo=True, photo_id=photo_id)
+        else:
+            self.cache_profile(me)
+        return await self.cache_full_profile(client,me)
 
     async def change_name(self, first_name, last_name):
         first_name, last_name = first_name.strip(), last_name.strip()
@@ -293,6 +307,95 @@ class TelegramGateway:
         result = await client(functions.photos.UploadProfilePhotoRequest(file=file))
         # The RPC's photo is authoritative; no second write or automatic retry.
         return self.cache_profile(me,thumbnail,replace_photo=True,photo_id=str(result.photo.id))
+
+    async def change_about(self, about):
+        if '\x00' in about:
+            raise AccountAccessError('ABOUT_INVALID','Описание содержит недопустимый символ.')
+        client=await self.client_for_account()
+        me=await inspect_account(client)
+        limit=140 if bool(getattr(me,'premium',False)) else 70
+        if len(about)>limit:
+            raise AccountAccessError('ABOUT_TOO_LONG',f'Описание этого аккаунта — до {limit} символов.')
+        await client(functions.account.UpdateProfileRequest(about=about))
+        return await self.read_profile()
+
+    async def premium_for_person(self, person):
+        if not person:
+            return None
+        client=await self.client_for_account()
+        try:
+            user=await client.get_entity(self.peer(person))
+        except (ValueError,errors.PeerIdInvalidError,errors.UserIdInvalidError):
+            return None
+        if not isinstance(user,types.User) or getattr(user,'min',False) or user.deleted:
+            return None
+        premium=bool(getattr(user,'premium',False))
+        self.db.execute('UPDATE people SET is_premium=?,premium_checked_at=? WHERE user_id=?',
+                        (int(premium),now(),person['user_id']))
+        return premium
+
+    async def react_story(self, person, story_id):
+        client=await self.client_for_account()
+        await client(functions.stories.SendReactionRequest(peer=self.peer(person),story_id=story_id,
+                     reaction=types.ReactionEmoji(emoticon='👍'),add_to_recent=False))
+
+    def channel_peer(self, channel):
+        data=json.loads(self.cipher.decrypt(channel['peer']))
+        return types.InputChannel(int(data['id']),int(data['hash']))
+
+    async def check_channel_username(self, username):
+        username=username.strip().removeprefix('@')
+        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}',username):
+            raise AccountAccessError('CHANNEL_USERNAME_INVALID','Username канала: 5–32 латинские буквы, цифры и подчёркивания; первая — буква.')
+        client=await self.client_for_account()
+        if not await client(functions.channels.CheckUsernameRequest(channel=types.InputChannelEmpty(),username=username)):
+            raise AccountAccessError('CHANNEL_USERNAME_OCCUPIED','Этот username канала уже занят.')
+        return username.lower()
+
+    async def create_channel(self, title, about):
+        client=await self.client_for_account()
+        result=await client(functions.channels.CreateChannelRequest(title=title,about=about,broadcast=True,megagroup=False))
+        channel=next((c for c in getattr(result,'chats',[]) if isinstance(c,types.Channel) and getattr(c,'broadcast',False)),None)
+        if not channel or not channel.access_hash:
+            raise AccountAccessError('CHANNEL_CREATE_UNCERTAIN','Результат создания канала не подтверждён.','Проверьте список каналов в Telegram перед новой попыткой.')
+        return {'id':str(channel.id),'title':channel.title,'username':channel.username,
+                'peer':self.cipher.encrypt(json.dumps({'id':channel.id,'hash':channel.access_hash}).encode())}
+
+    async def channel_username(self, channel_id, username):
+        channel=self.db.one('SELECT * FROM channels WHERE id=?',(channel_id,))
+        if not channel:
+            raise AccountAccessError('CHANNEL_NOT_FOUND','Канал не найден среди созданных этим аккаунтом.')
+        username=username.strip().removeprefix('@')
+        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}',username):
+            raise AccountAccessError('CHANNEL_USERNAME_INVALID','Введите username канала: 5–32 символа, первая — латинская буква.')
+        client=await self.client_for_account()
+        try:
+            await client(functions.channels.UpdateUsernameRequest(channel=self.channel_peer(channel),username=username))
+        except errors.UsernameNotModifiedError:
+            pass
+        self.db.execute('UPDATE channels SET username=? WHERE id=?',(username.lower(),channel_id))
+        return self.db.public_account()
+
+    async def pin_channel(self, ref):
+        client=await self.client_for_account()
+        if not ref.strip():
+            peer=types.InputChannelEmpty()
+        else:
+            saved=self.db.one('SELECT * FROM channels WHERE id=?',(ref,))
+            if saved:
+                if not saved['username']:
+                    raise AccountAccessError('CHANNEL_PUBLIC_REQUIRED','Сначала назначьте публичный username каналу.')
+                peer=self.channel_peer(saved)
+            else:
+                normalized=normalize_chat(ref)
+                if not normalized.startswith('@'):
+                    raise AccountAccessError('CHANNEL_REF_INVALID','Укажите @username своего публичного канала.')
+                entity=await client.get_entity(normalized)
+                if not isinstance(entity,types.Channel) or not entity.broadcast or not entity.creator or not entity.username:
+                    raise AccountAccessError('CHANNEL_OWNER_REQUIRED','Можно закрепить только свой публичный канал.')
+                peer=types.InputChannel(entity.id,entity.access_hash)
+        await client(functions.account.UpdatePersonalChannelRequest(channel=peer))
+        return await self.read_profile()
 
     async def resolve(self, ref):
         client = await self.client_for_account()
@@ -394,7 +497,7 @@ class TelegramGateway:
                 continue
             expires = int(item.expire_date.timestamp())
             if expires > now():
-                stories.append({'id':item.id,'expires':expires})
+                stories.append({'id':item.id,'expires':expires,'has_reaction':bool(getattr(item,'sent_reaction',None))})
         return stories
 
     async def register_views(self, person, story_ids):

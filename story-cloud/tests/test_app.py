@@ -20,9 +20,12 @@ class FakeGateway:
         self.db,self.cipher=db,cipher
         self.lock=asyncio.Lock()
         self.calls=[]
+        self.reactions=[]
         self.fail=None
         self.import_path=None
         self.after_stories=None
+        self.reactions=[]
+        self.premium=False
 
     async def close(self):
         pass
@@ -42,6 +45,14 @@ class FakeGateway:
         if self.after_stories:
             self.after_stories()
         return [{'id':7,'expires':now()+3600}] if person['user_id']=='11111' else []
+
+    async def premium_for_person(self,person):
+        return self.premium
+
+    async def react_story(self,person,story_id):
+        self.reactions.append((person['user_id'],story_id))
+        if self.fail:
+            raise self.fail
 
     async def register_views(self,person,ids):
         self.calls.append((person['user_id'],ids))

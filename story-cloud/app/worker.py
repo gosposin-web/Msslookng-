@@ -233,6 +233,8 @@ class Worker:
 
     async def view(self, job):
         p=job['payload']
+        if p.get('phase')=='reactions':
+            return await self.react(job)
         position=p.get('position',0)
         if position>=len(p['user_ids']):
             self.db.update_job(job['id'],status='done',message='Просмотр выбранной аудитории завершён.')
@@ -240,7 +242,7 @@ class Worker:
             return 0
         account=self.db.account()
         if not account:
-            raise ValueError('Account disconnected')
+            raise TelegramError('Аккаунт отключён.')
         recent=self.db.one('SELECT COUNT(*) n FROM views WHERE account_id=? AND viewed_at>?',
                            (account['user_id'],now()-86400))['n']
         recent+=self.db.one('SELECT COUNT(*) n FROM view_attempts WHERE account_id=? AND created_at>?',
@@ -250,18 +252,21 @@ class Worker:
             return 0
         person=self.db.one('SELECT * FROM people WHERE user_id=?',(p['user_ids'][position],))
         count=0
+        pending=False
         if person:
             stories=await self.gateway.stories(person)
+            self.ensure_snapshot(job)
+            if not self.db.running(job['id']):
+                return 0
+            premium=await self.gateway.premium_for_person(person) if p.get('auto_react',False) else None
             self.ensure_snapshot(job)
             if not self.db.running(job['id']):
                 return 0
             self.db.execute('UPDATE people SET stories=?,checked_at=? WHERE user_id=?',
                             (json.dumps(stories),now(),person['user_id']))
             seen=self.db.viewed_ids(account['user_id'],person['user_id'])
-            ids=[s['id'] for s in stories if s['id'] not in seen][:min(200,VIEW_LIMIT_24H-recent)]
-            if ids and self.db.running(job['id']):
-                # Checkpoint BEFORE the irreversible RPC. An interruption leaves the job paused;
-                # it is never automatically replayed after an uncertain network outcome.
+            ids=[story['id'] for story in stories if story['id'] not in seen][:min(200,VIEW_LIMIT_24H-recent)]
+            if ids:
                 p['uncertain']={'user_id':person['user_id'],'story_ids':ids}
                 with self.db.connect() as c:
                     c.execute('UPDATE jobs SET payload=? WHERE id=?',(json.dumps(p),job['id']))
@@ -269,7 +274,6 @@ class Worker:
                         c.execute('INSERT OR IGNORE INTO view_attempts VALUES(?,?,?,?)',
                                   (account['user_id'],person['user_id'],story_id,now()))
                 if self.storage:
-                    # The intent MUST be durable before the view RPC is issued.
                     await self.storage.flush()
                 try:
                     await self.gateway.register_views(person,ids)
@@ -292,9 +296,76 @@ class Worker:
                                   (account['user_id'],person['user_id'],story_id,now()))
                         c.execute('DELETE FROM view_attempts WHERE account_id=? AND user_id=? AND story_id=?',
                                   (account['user_id'],person['user_id'],story_id))
-                count=len(ids)
-                p.pop('uncertain',None)
+                    current=c.execute('SELECT status FROM jobs WHERE id=?',(job['id'],)).fetchone()
+                    if p.get('auto_react',False) and premium is False and current and current['status'] in ('running','paused'):
+                        for story in stories:
+                            if story['id'] in ids and not story.get('has_reaction'):
+                                c.execute('INSERT OR IGNORE INTO reaction_tasks(account_id,user_id,story_id,job_id,status,expires,updated_at) VALUES(?,?,?,?,?,?,?)',
+                                          (account['user_id'],person['user_id'],story['id'],job['id'],'pending',story['expires'],now()))
+                        pending=bool(c.execute("SELECT 1 FROM reaction_tasks WHERE job_id=? AND user_id=? AND status='pending'",
+                                               (job['id'],person['user_id'])).fetchone())
+                    count=len(ids)
+                    p.pop('uncertain',None)
+                    if pending:
+                        p['phase']='reactions'
+                        p['reaction_user']=person['user_id']
+                    else:
+                        p['position']=position+1
+                    c.execute('UPDATE jobs SET payload=?,checked=checked+1,viewed=viewed+?,message=?,updated_at=? WHERE id=?',
+                              (json.dumps(p),count,'Просмотры сохранены. '+('Отправляем реакцию без Premium.' if pending else 'Продолжаем просмотр.'),now(),job['id']))
+                return 3 if pending else p['delay']
         p['position']=position+1
         self.db.update_job(job['id'],payload=p,checked=job['checked']+1,viewed=job['viewed']+count,
                            message='Просмотр выбранных историй.')
         return p['delay']
+
+    async def react(self,job):
+        p=job['payload']
+        task=self.db.one("SELECT * FROM reaction_tasks WHERE job_id=? AND user_id=? AND status='pending' ORDER BY story_id LIMIT 1",
+                         (job['id'],p['reaction_user']))
+        if not task:
+            p['position']=p.get('position',0)+1
+            p.pop('phase',None)
+            p.pop('reaction_user',None)
+            self.db.update_job(job['id'],payload=p,message='Переходим к следующему пользователю.')
+            return p['delay']
+        person=self.db.one('SELECT * FROM people WHERE user_id=?',(task['user_id'],))
+        premium=await self.gateway.premium_for_person(person) if person else None
+        self.ensure_snapshot(job)
+        if not self.db.running(job['id']):
+            return 0
+        key=(task['account_id'],task['user_id'],task['story_id'])
+        if premium is not False or task['expires']<=now():
+            message='История истекла.' if task['expires']<=now() else 'У автора Premium или статус Premium не подтверждён.'
+            self.db.execute("UPDATE reaction_tasks SET status='skipped',message=?,updated_at=? WHERE account_id=? AND user_id=? AND story_id=?",
+                            (message,now(),*key))
+            return 3
+        used=self.db.one("SELECT COUNT(*) n FROM reaction_tasks WHERE status IN ('done','sending','uncertain') AND updated_at>?",(now()-86400,))['n']
+        if used>=VIEW_LIMIT_24H:
+            self.db.update_job(job['id'],status='paused',message='Достигнут внутренний лимит: 200 реакций за 24 часа.')
+            return 0
+        self.db.execute("UPDATE reaction_tasks SET status='sending',updated_at=? WHERE account_id=? AND user_id=? AND story_id=?",(now(),*key))
+        try:
+            if self.storage:
+                await self.storage.flush()
+            await self.gateway.react_story(person,task['story_id'])
+            self.ensure_snapshot(job)
+        except FloodWaitError:
+            self.db.execute("UPDATE reaction_tasks SET status='pending' WHERE account_id=? AND user_id=? AND story_id=?",key)
+            raise
+        except BaseException as exc:
+            known={'ReactionInvalidError','StoryIdInvalidError','StoryIdEmptyError','PeerIdInvalidError','UserPrivacyRestrictedError','ChatWriteForbiddenError','UserIsBlockedError'}
+            if type(exc).__name__ in known:
+                self.db.execute("UPDATE reaction_tasks SET status='skipped',message=?,updated_at=? WHERE account_id=? AND user_id=? AND story_id=?",
+                                ('Telegram не разрешил реакцию на эту историю.',now(),*key))
+                return 3
+            if job.get('_restore_generation')==getattr(self.storage,'restore_generation',0):
+                self.db.execute("UPDATE reaction_tasks SET status='uncertain',message=?,updated_at=? WHERE account_id=? AND user_id=? AND story_id=?",
+                                ('Результат реакции не подтверждён. Повторная отправка исключена.',now(),*key))
+                if self.db.running(job['id']):
+                    self.db.update_job(job['id'],status='paused',message='Результат реакции не подтверждён. При продолжении она будет пропущена.')
+            raise
+        with self.db.connect() as c:
+            c.execute("UPDATE reaction_tasks SET status='done',message='',updated_at=? WHERE account_id=? AND user_id=? AND story_id=?",(now(),*key))
+            c.execute('UPDATE jobs SET reacted=reacted+1,message=?,updated_at=? WHERE id=?',('Реакция 👍 отправлена.',now(),job['id']))
+        return 3

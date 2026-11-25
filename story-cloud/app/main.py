@@ -23,7 +23,7 @@ from .archive import ArchiveError, MAX_UPLOAD, extract_tdata
 from .config import Config
 from .db import DB, now
 from .accounts import AccountHub, MAX_ACCOUNTS
-from .accounts import AccountHub, MAX_ACCOUNTS
+from .channels import create_channel as create_owned_channel
 from .telegram import TelegramError, TelegramGateway, normalize_chat, api_credentials
 from .worker import VIEW_LIMIT_24H, Worker
 from .snapshot import SnapshotStore, SnapshotError
@@ -108,6 +108,22 @@ class ControlInput(BaseModel):
 class NameInput(BaseModel):
     first_name: str = Field(max_length=64)
     last_name: str = Field(default='',max_length=64)
+
+
+class AboutInput(BaseModel):
+    about: str = Field(default='',max_length=140)
+
+
+class PersonalChannelInput(BaseModel):
+    ref: str = Field(default='',max_length=200)
+
+
+class ChannelInput(BaseModel):
+    title: str = Field(min_length=1,max_length=128)
+    about: str = Field(default='',max_length=255)
+    username: str = Field(min_length=5,max_length=33)
+    pin: bool = True
+    request_id: str = Field(min_length=16,max_length=80)
 
 
 class UsernameInput(BaseModel):
@@ -309,8 +325,8 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                            SUM(j.status='done') done,SUM(j.status='failed') failed,SUM(j.status='cancelled') cancelled
                            FROM source_imports i JOIN source_import_jobs ij ON ij.import_id=i.id
                            JOIN jobs j ON j.id=ij.job_id GROUP BY i.id ORDER BY i.created_at DESC,i.rowid DESC LIMIT 5''')
-        return {'account':db.public_account(),'accounts':hub.public_accounts(),
-                'active_account':db.slot,'max_accounts':MAX_ACCOUNTS,'accounts':hub.public_accounts(),'active_account':db.slot,'max_accounts':MAX_ACCOUNTS,
+        return {'account':db.public_account(),'accounts':hub.public_accounts(),'active_account':db.slot,'max_accounts':MAX_ACCOUNTS,
+                'channels':db.all('SELECT id,title,username,created_at FROM channels ORDER BY created_at DESC LIMIT 100'),
                 'sources':sources,'jobs':jobs,'events':db.all('SELECT * FROM events ORDER BY id DESC LIMIT 50'),
                 'job_counts':job_counts,'job_total':sum(job_counts.values()),'source_imports':imports,
                 'stats':{'people':counts['people'],'active':counts['active'],'views_24h':db.one('SELECT COUNT(*) n FROM views WHERE viewed_at>?',(now()-86400,))['n']},
@@ -319,10 +335,6 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                 'telegram_api_mode':'custom' if config.telegram_api_id and config.telegram_api_hash else 'public' if config.public_api_defaults else 'required',
                 'auth_mode':'chatgpt' if config.bridge_secret else 'password',
                 'free_mode':config.free_mode,'storage_error':storage.error if storage else ''}
-
-    @app.get('/api/accounts')
-    def accounts(login=Depends(authenticated)):
-        return {'accounts':hub.public_accounts(),'active_account':db.slot,'max_accounts':MAX_ACCOUNTS}
 
     @app.post('/api/account/tdata')
     async def import_tdata(request: Request,file: UploadFile=File(...),api_id: int=Form(0),
@@ -426,6 +438,41 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
     async def profile_name(body: NameInput,login=Depends(authenticated)):
         return await profile_action(lambda:gateway.change_name(body.first_name,body.last_name),mutation=True)
 
+    @app.post('/api/account/profile/about')
+    async def profile_about(body: AboutInput,login=Depends(authenticated)):
+        return await profile_action(lambda:gateway.change_about(body.about),mutation=True)
+
+    @app.post('/api/account/profile/channel')
+    async def profile_channel(body: PersonalChannelInput,login=Depends(authenticated)):
+        return await profile_action(lambda:gateway.pin_channel(body.ref),mutation=True)
+
+    @app.post('/api/account/channels')
+    async def channel_create(body: ChannelInput,login=Depends(authenticated)):
+        need_account()
+        if gateway.lock.locked():
+            raise HTTPException(409,'Аккаунт занят. Приостановите задание или дождитесь окончания действия.')
+        try:
+            async with gateway.lock:
+                check_telegram_cooldown()
+                if storage:
+                    await storage.flush()
+                async with asyncio.timeout(90):
+                    result=await create_owned_channel(db,gateway,storage,body.title,body.about,body.username,body.pin,body.request_id)
+                if storage:
+                    await storage.flush()
+                return result
+        except SnapshotError as exc:
+            raise HTTPException(503,str(exc)) from None
+        except Exception as exc:
+            return error_response(exc)
+
+    @app.post('/api/account/channels/{channel_id}/username')
+    async def channel_username(channel_id: str,body: UsernameInput,login=Depends(authenticated)):
+        async def change():
+            await gateway.channel_username(channel_id,body.username)
+            return await gateway.read_profile()
+        return await profile_action(change,mutation=True)
+
     @app.post('/api/account/profile/username')
     async def profile_username(body: UsernameInput,login=Depends(authenticated)):
         return await profile_action(lambda:gateway.change_username(body.username),mutation=True)
@@ -476,6 +523,9 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                 c.execute('DELETE FROM runtime')
                 c.execute('DELETE FROM source_imports')
                 c.execute('DELETE FROM people_imports')
+                c.execute('DELETE FROM reaction_tasks')
+                c.execute('DELETE FROM channel_requests')
+                c.execute('DELETE FROM channels')
             db.event('Аккаунт отключён. Локальные данные сессии и аудитории удалены.')
         return {'ok':True,'revoked':revoked,'message':('Облачная сессия завершена.' if revoked else 'Данные удалены. Завершите сессию ZAVOD 1.0 в настройках Telegram, если она осталась активной.')}
 
@@ -627,7 +677,7 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                 raise HTTPException(400,'У выбранных пользователей сейчас нет проверенных активных историй.')
             job_id=uuid.uuid4().hex
             c.execute("INSERT INTO jobs(id,kind,status,payload,created_at,updated_at) VALUES(?,'view','queued',?,?,?)",
-                      (job_id,json.dumps({'user_ids':selected,'position':0,'delay':body.delay}),now(),now()))
+                      (job_id,json.dumps({'user_ids':selected,'position':0,'delay':body.delay,'auto_react':True}),now(),now()))
             c.execute('INSERT INTO events(job_id,level,message,created_at) VALUES(?,?,?,?)',(job_id,'info','Задание добавлено в очередь.',now()))
             return {'id':job_id}
 
@@ -648,6 +698,7 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                     raise HTTPException(409,'Сначала подключите аккаунт.')
                 if job['kind']=='scan' and c.execute("SELECT id FROM jobs WHERE source_id=? AND id<>? AND kind='scan' AND status IN ('queued','running','waiting','paused')",(job['source_id'],job_id)).fetchone():
                     raise HTTPException(409,'Для этого чата уже есть другой незавершённый сбор.')
+                c.execute("UPDATE reaction_tasks SET status='uncertain',message='Неподтверждённая реакция пропущена.' WHERE job_id=? AND status='sending'",(job_id,))
                 payload=json.loads(job['payload'])
                 if payload.get('uncertain'):
                     payload['position']=payload.get('position',0)+1

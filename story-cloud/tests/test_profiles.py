@@ -26,6 +26,7 @@ class ProtocolClient:
         self.me = types.User(90000,is_self=True,first_name='Старое',last_name='Имя',username='old_name')
         self.config = types.JsonObject([])
         self.calls = []
+        self.about = ''
         self.fail = None
         self.username_available = True
         self.logged_out = False
@@ -55,8 +56,12 @@ class ProtocolClient:
             return [self.me]
         if isinstance(request,functions.help.GetAppConfigRequest):
             return types.help.AppConfig(hash=1,config=self.config)
+        if isinstance(request,functions.users.GetFullUserRequest):
+            return SimpleNamespace(full_user=SimpleNamespace(about=self.about,personal_channel_id=None),chats=[])
         if isinstance(request,functions.account.UpdateProfileRequest):
-            self.me.first_name, self.me.last_name = request.first_name, request.last_name
+            if request.first_name is not None: self.me.first_name=request.first_name
+            if request.last_name is not None: self.me.last_name=request.last_name
+            if request.about is not None: self.about=request.about
             return self.me
         if isinstance(request,functions.account.CheckUsernameRequest):
             return self.username_available

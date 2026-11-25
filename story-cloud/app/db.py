@@ -77,12 +77,35 @@ class DB:
                 CREATE TABLE IF NOT EXISTS people_imports (
                     id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL,
                     job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, created_at INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS reaction_tasks (
+                    account_id TEXT NOT NULL,user_id TEXT NOT NULL,story_id INTEGER NOT NULL,
+                    job_id TEXT NOT NULL,status TEXT NOT NULL,expires INTEGER NOT NULL,
+                    message TEXT NOT NULL DEFAULT '',updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(account_id,user_id,story_id));
+                CREATE TABLE IF NOT EXISTS channels (
+                    id TEXT PRIMARY KEY,title TEXT NOT NULL,username TEXT,peer BLOB NOT NULL,
+                    created_at INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS channel_requests (
+                    id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,result TEXT NOT NULL,
+                    status TEXT NOT NULL,created_at INTEGER NOT NULL);
                 CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(status,next_run,created_at);
                 CREATE INDEX IF NOT EXISTS jobs_source_created ON jobs(source_id,created_at);
                 CREATE INDEX IF NOT EXISTS job_people_unchecked ON job_people(job_id,checked,user_id);
                 CREATE INDEX IF NOT EXISTS views_recent ON views(account_id,viewed_at);
                 CREATE INDEX IF NOT EXISTS view_attempts_recent ON view_attempts(account_id,created_at);
             ''')
+            additions={
+                'people':{'is_premium':'INTEGER','premium_checked_at':'INTEGER'},
+                'jobs':{'reacted':'INTEGER NOT NULL DEFAULT 0'},
+                'account_profile':{'about':"TEXT NOT NULL DEFAULT ''",'is_premium':'INTEGER',
+                    'personal_channel_id':"TEXT NOT NULL DEFAULT ''",'personal_channel_title':"TEXT NOT NULL DEFAULT ''",
+                    'personal_channel_username':"TEXT NOT NULL DEFAULT ''"},
+            }
+            for table,fields in additions.items():
+                existing={row['name'] for row in c.execute('PRAGMA table_info('+table+')')}
+                for name,definition in fields.items():
+                    if name not in existing:
+                        c.execute('ALTER TABLE '+table+' ADD COLUMN '+name+' '+definition)
 
     @contextmanager
     def connect(self):
@@ -120,13 +143,17 @@ class DB:
         account = self.account()
         if not account:
             return None
-        profile = self.one('SELECT first_name,last_name,photo_revision,updated_at,photo IS NOT NULL AS has_avatar FROM account_profile WHERE id=1')
+        profile = self.one('SELECT first_name,last_name,photo_revision,updated_at,about,is_premium,personal_channel_id,personal_channel_title,personal_channel_username,photo IS NOT NULL AS has_avatar FROM account_profile WHERE id=1')
         return {k:account[k] for k in ('user_id','name','username','created_at')} | {
             'first_name':profile['first_name'] if profile else None,
             'last_name':profile['last_name'] if profile else None,
             'has_avatar':bool(profile and profile['has_avatar']),
             'photo_revision':profile['photo_revision'] if profile else '',
             'profile_loaded':bool(profile),
+            'about':profile['about'] if profile else '',
+            'is_premium':bool(profile and profile['is_premium']),
+            'personal_channel':({'id':profile['personal_channel_id'],'title':profile['personal_channel_title'],
+                                 'username':profile['personal_channel_username']} if profile and profile['personal_channel_id'] else None),
         }
 
     def event(self, message, job_id=None, level='info'):
@@ -150,7 +177,7 @@ class DB:
         return row
 
     def update_job(self, job_id, **fields):
-        allowed = {'payload','status','collected','checked','found','viewed','message','next_run','retries'}
+        allowed = {'payload','status','collected','checked','found','viewed','reacted','message','next_run','retries'}
         if not set(fields) <= allowed:
             raise ValueError('Unknown job fields')
         if 'payload' in fields:
@@ -179,6 +206,7 @@ class DB:
         self.execute("UPDATE jobs SET status='queued',next_run=?,updated_at=? WHERE id=? AND status='running'", (now()+delay,now(),job_id))
 
     def recover(self):
+        self.execute("UPDATE reaction_tasks SET status='uncertain',message='Сервер перезапущен до подтверждения реакции.' WHERE status='sending'")
         # A view RPC might have succeeded before a crash. Do not silently repeat it.
         self.execute("UPDATE jobs SET status='paused',message='Сервер перезапущен. Проверьте результат и продолжите вручную.',updated_at=? WHERE status='running' AND kind='view'", (now(),))
         self.execute("UPDATE jobs SET status='queued',updated_at=? WHERE status='running' AND kind IN ('scan','people_import')", (now(),))
