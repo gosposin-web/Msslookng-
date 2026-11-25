@@ -1,0 +1,43 @@
+name: ZAVOD draft checks
+
+on:
+  push:
+    branches: [zavod-1-0]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zavod-draft-checks
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: story-cloud
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libglib2.0-0 libxkbcommon-x11-0
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Check Python and account isolation
+        run: python -m pytest -q
+      - name: Check browser and gateway behavior
+        run: npm test
