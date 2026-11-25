@@ -34,17 +34,27 @@ def scoped_sql(sql, slot):
     if slot == 1:
         return sql
     prefix = f'account_{slot}_'
-    parts = _QUOTED.split(sql)
-    for i, part in enumerate(parts):
-        if i % 2:
-            if not part or part.startswith("'"):
-                continue
-            inner = part[1:-1]
-            if inner.casefold() in _NAMES:
-                parts[i] = part[0] + prefix + inner.casefold() + part[-1]
-        else:
-            parts[i] = _IDENTIFIER.sub(lambda match: prefix + match.group(0).casefold(), part)
-    return ''.join(parts)
+    tokens = re.findall(r"""'(?:''|[^'])*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_]*|\s+|.""", sql, re.S)
+    significant = [i for i, token in enumerate(tokens) if not token.isspace()]
+    for position, index in enumerate(significant):
+        token = tokens[index]
+        if token.startswith("'"):
+            continue
+        quoted = token[:1] in ('"', '`', '[')
+        name = token[1:-1] if quoted else token
+        if name.casefold() not in _NAMES:
+            continue
+        before = tokens[significant[position-1]].upper() if position else ''
+        after = tokens[significant[position+1]] if position+1 < len(significant) else ''
+        prior = [tokens[j].upper() for j in significant[max(0,position-4):position]]
+        table_position = before in {'FROM','JOIN','INTO','UPDATE','REFERENCES','TABLE','INDEX'}
+        table_position |= prior in (['TABLE','IF','NOT','EXISTS'], ['INDEX','IF','NOT','EXISTS'])
+        table_position |= before == 'ON' and after == '('
+        table_position |= before == '(' and position > 1 and tokens[significant[position-2]].upper() == 'TABLE_INFO'
+        if table_position or after == '.':
+            replacement = prefix + name.casefold()
+            tokens[index] = token[0] + replacement + token[-1] if quoted else replacement
+    return ''.join(tokens)
 
 
 class ScopedCursor(sqlite3.Cursor):
