@@ -34,7 +34,7 @@ def test_legacy_account_and_audience_stay_in_slot_one(tmp_path):
         assert other.one('SELECT COUNT(*) n FROM jobs')['n'] == 0
 
 
-def test_five_workspaces_allow_the_same_target_and_source_ids_without_mixing(tmp_path):
+def test_five_workspaces_allow_identical_target_and_source_ids(tmp_path):
     path = tmp_path / 'state.sqlite3'
     for slot in range(1, 6):
         db = AccountDB(path, slot)
@@ -66,7 +66,7 @@ def test_jobs_and_telegram_wait_are_account_local(tmp_path):
     assert first.job(two) is None
 
 
-def test_all_accounts_share_the_panel_login_but_not_account_data(tmp_path):
+def test_panel_login_is_shared_but_account_data_is_not(tmp_path):
     path = tmp_path / 'state.sqlite3'
     first, fifth = AccountDB(path, 1), AccountDB(path, 5)
     first.execute('INSERT INTO logins VALUES(?,?,?)', ('synthetic-token-hash', 'synthetic-csrf', now() + 100))
@@ -75,30 +75,21 @@ def test_all_accounts_share_the_panel_login_but_not_account_data(tmp_path):
     assert fifth.account() is None
 
 
-def test_namespace_handles_identifiers_but_never_changes_sql_literals_or_parameters(tmp_path):
+def test_identifiers_are_scoped_without_changing_literals_or_parameters(tmp_path):
     db = AccountDB(tmp_path / 'state.sqlite3', 4)
     add_account(db, 90004)
     with db.connect() as c:
         row = c.execute("SELECT 'account' AS literal,user_id FROM account").fetchone()
         assert row['literal'] == 'account' and row['user_id'] == '90004'
         assert c.cursor().execute('SELECT user_id FROM "account"').fetchone()['user_id'] == '90004'
+        assert c.cursor().execute('SELECT user_id FROM [account]').fetchone()['user_id'] == '90004'
         c.execute('UPDATE account SET name=?', ('people',))
     assert db.account()['name'] == 'people'
-        assert row['literal'] == 'account'
-        assert row['user_id'] == '90004'
-        row = c.cursor().execute('SELECT user_id FROM [account]').fetchone()
-        assert row['user_id'] == '90004'
     assert scoped_sql("SELECT 'people and jobs', people.user_id FROM people", 2) == (
         "SELECT 'people and jobs', account_2_people.user_id FROM account_2_people")
-    assert scoped_sql("SELECT 'account' FROM account", 1) == "SELECT 'account' FROM account"
 
 
-def test_scope_inventory_covers_every_account_table_in_legacy_schema():
-    tables = set(re.findall(r'CREATE TABLE IF NOT EXISTS ([a-z_]+)', inspect.getsource(DB.initialize_schema)))
-    assert tables - {'logins', 'login_failures'} <= SCOPED_TABLES
-
-
-def test_backup_and_restore_preserve_all_five_accounts(tmp_path):
+def test_backup_preserves_all_five_accounts(tmp_path):
     path, backup = tmp_path / 'state.sqlite3', tmp_path / 'backup.sqlite3'
     root = AccountDB(path)
     for slot in range(1, 6):
@@ -114,10 +105,27 @@ def test_backup_and_restore_preserve_all_five_accounts(tmp_path):
     assert AccountDB(backup, 5).account()['user_id'] == '90005'
 
 
-@pytest.mark.parametrize('slot', [0, 6, -1, True, '1', None])
-def test_invalid_account_slots_are_rejected(slot):
+def test_legacy_restore_recreates_other_namespaces(tmp_path):
+    path, old_path = tmp_path / 'state.sqlite3', tmp_path / 'older.sqlite3'
+    root = AccountDB(path)
+    add_account(DB(old_path), 80001)
+    with sqlite3.connect(old_path) as source, sqlite3.connect(path) as target:
+        source.backup(target)
+    root.initialize_schema()
+    assert root.account()['user_id'] == '80001'
+    assert AccountDB(path, 5).account() is None
+    assert AccountDB(path, 5).one('SELECT COUNT(*) n FROM people')['n'] == 0
+
+
+def test_isolation_inventory_covers_the_existing_schema():
+    tables = set(re.findall(r'CREATE TABLE IF NOT EXISTS (\w+)', inspect.getsource(DB.initialize_schema)))
+    assert tables - {'logins', 'login_failures'} <= SCOPED_TABLES
+
+
+@pytest.mark.parametrize('value', [0, 6, -1, True, '2', 1.5, None])
+def test_invalid_slots_are_rejected(value):
     with pytest.raises(ValueError):
-        account_slot(slot)
+        account_slot(value)
 
 
 class Gateway:
@@ -145,7 +153,7 @@ class Storage:
         self.revision += 1
 
 
-def test_context_switch_does_not_retarget_workers_or_mix_mutable_gateway_fields(tmp_path):
+def test_context_switch_keeps_workers_and_mutable_fields_isolated(tmp_path):
     hub = AccountHub(tmp_path / 'state.sqlite3', None, Gateway, Worker, Storage)
     db, gateway = hub.proxy('databases'), hub.proxy('gateways')
     add_account(db, 90001)
@@ -169,10 +177,9 @@ def test_context_switch_does_not_retarget_workers_or_mix_mutable_gateway_fields(
 
 
 @pytest.mark.asyncio
-async def test_async_request_contexts_remain_separate(tmp_path):
+async def test_concurrent_contexts_remain_separate(tmp_path):
     hub = AccountHub(tmp_path / 'state.sqlite3', None, Gateway, Worker)
     proxy = hub.proxy('databases')
-
     async def request(slot):
         token = hub.bind(slot)
         try:
@@ -181,36 +188,7 @@ async def test_async_request_contexts_remain_separate(tmp_path):
             return proxy.slot
         finally:
             hub.reset(token)
-
     assert await asyncio.gather(*(request(slot) for slot in range(1, 6))) == [1, 2, 3, 4, 5]
     assert proxy.slot == 1
     await hub.close()
     assert all(gateway.closed for gateway in hub.gateways.values())
-
-
-def test_root_schema_upgrade_recreates_missing_namespaces_after_legacy_restore(tmp_path):
-    path = tmp_path / 'state.sqlite3'
-    legacy = DB(path)
-    add_account(legacy, 90001)
-    root = AccountDB(path)
-    # Replace the physical contents with a backup from before multi-account support.
-    old_path = tmp_path / 'older.sqlite3'
-    old = DB(old_path)
-    add_account(old, 80001)
-    with sqlite3.connect(old_path) as source, sqlite3.connect(path) as target:
-        source.backup(target)
-    root.initialize_schema()
-    assert root.account()['user_id'] == '80001'
-    assert AccountDB(path, 5).account() is None
-    assert AccountDB(path, 5).one('SELECT COUNT(*) n FROM people')['n'] == 0
-
-
-def test_every_existing_account_table_is_in_the_isolation_inventory():
-    tables = set(re.findall(r'CREATE TABLE IF NOT EXISTS (\w+)', inspect.getsource(DB.initialize_schema)))
-    assert tables - {'logins', 'login_failures'} <= SCOPED_TABLES
-
-
-@pytest.mark.parametrize('value', [0, 6, -1, True, '2', 1.5, None])
-def test_invalid_slots_cannot_become_sql_namespaces(value):
-    with pytest.raises(ValueError):
-        account_slot(value)

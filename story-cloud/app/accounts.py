@@ -1,8 +1,4 @@
-"""Account-isolated SQLite workspaces for ZAVOD 1.0.
-
-Draft integration module. Every slot has its own data tables in the same
-checkpoint file. Login sessions belong to the panel and are shared.
-"""
+"""Five account-local workspaces inside the existing encrypted checkpoint."""
 import asyncio
 import re
 import sqlite3
@@ -62,22 +58,11 @@ class ScopedCursor(sqlite3.Cursor):
         return super().executescript(scoped_sql(sql, self.connection.slot))
 
 
-class ScopedCursor(sqlite3.Cursor):
-    def execute(self, sql, parameters=(), /):
-        return super().execute(scoped_sql(sql, self.connection.slot), parameters)
-
-    def executemany(self, sql, parameters, /):
-        return super().executemany(scoped_sql(sql, self.connection.slot), parameters)
-
-    def executescript(self, sql, /):
-        return super().executescript(scoped_sql(sql, self.connection.slot))
-
-
 class ScopedConnection(sqlite3.Connection):
     slot = 1
 
     def cursor(self, factory=ScopedCursor):
-        return super().cursor(factory)
+        return super().cursor(factory=factory)
 
     def execute(self, sql, parameters=(), /):
         return super().execute(scoped_sql(sql, self.slot), parameters)
@@ -88,9 +73,6 @@ class ScopedConnection(sqlite3.Connection):
     def executescript(self, sql, /):
         return super().executescript(scoped_sql(sql, self.slot))
 
-    def cursor(self, factory=ScopedCursor):
-        return super().cursor(factory)
-
 
 class AccountDB(DB):
     def __init__(self, path: Path, slot=1):
@@ -100,16 +82,7 @@ class AccountDB(DB):
     def initialize_schema(self):
         super().initialize_schema()
         if self.slot == 1:
-            # Snapshot restore invokes this method on the root database too.
-            # Older checkpoints gain empty workspaces without moving slot 1.
-            for slot in range(2, MAX_ACCOUNTS + 1):
-                AccountDB(self.path, slot)
-
-    def initialize_schema(self):
-        super().initialize_schema()
-        if self.slot == 1:
-            # Snapshot restore calls this method on the root DB. Recreate the
-            # other namespaces if the checkpoint predates multi-account support.
+            # Also runs after restoring an older single-account checkpoint.
             for slot in range(2, MAX_ACCOUNTS + 1):
                 AccountDB(self.path, slot)
 
@@ -133,11 +106,7 @@ class AccountDB(DB):
 
 
 class AccountHub:
-    """Own five independent clients/workers and one physical checkpoint file."""
-
     def __init__(self, path, cipher, gateway_factory, worker_factory, storage_factory=None):
-        from contextvars import ContextVar
-        self._active = ContextVar('zavod_account_slot', default=1)
         root = AccountDB(Path(path), 1)
         self.databases = {1: root}
         self.databases.update({slot: AccountDB(Path(path), slot) for slot in range(2, MAX_ACCOUNTS + 1)})
@@ -151,6 +120,8 @@ class AccountHub:
             for slot, db in self.databases.items()
         }
         self.import_lock = asyncio.Lock()
+        from contextvars import ContextVar
+        self._active = ContextVar('zavod_active_account', default=1)
 
     def bind(self, slot):
         return self._active.set(account_slot(slot))
