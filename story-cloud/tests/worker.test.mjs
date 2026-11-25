@@ -17,6 +17,24 @@ class Bucket{
  }
 }
 const env=()=>({STORY_BRIDGE_SECRET:'a-test-secret',BUCKET:new Bucket()});
+test('A known monthly hosting pause is explicit and makes no upstream request',async()=>{
+ const e=env();e.BACKEND_URL='https://backend.test';e.BACKEND_PAUSED_UNTIL=String(Math.floor(Date.now()/1000)+86400);
+ const previous=globalThis.fetch;let calls=0;
+ globalThis.fetch=async()=>{calls++;throw new Error('Must not contact suspended backend');};
+ try{
+  const r=await worker.fetch(new Request('https://private.test/health'),e);
+  assert.equal(r.status,503);assert.equal((await r.json()).reason,'hosting_monthly_quota');assert.equal(calls,0);assert(Number(r.headers.get('retry-after'))>86390);
+ }finally{globalThis.fetch=previous;}
+});
+test('Proxy forwards the selected account without forwarding visitor credentials',async()=>{
+ const e=env();e.BACKEND_URL='https://backend.test';const previous=globalThis.fetch;let observed;
+ globalThis.fetch=async(url,options)=>{observed=options;return Response.json({ok:true});};
+ try{
+  const r=await worker.fetch(request('/api/account/profile/about','POST',{'oai-authenticated-user-id':'site-owner','X-Story-Account':'5','Content-Type':'application/json','Origin':'https://private.test','Cookie':'private=1','Authorization':'Bearer secret'},JSON.stringify({about:'Описание'})),e);
+  assert.equal(r.status,200);assert.equal(observed.headers.get('x-story-account'),'5');
+  assert.equal(observed.headers.get('cookie'),null);assert.equal(observed.headers.get('authorization'),null);
+ }finally{globalThis.fetch=previous;}
+});
 function request(path,method='GET',headers={},body){return new Request('https://private.test'+path,{method,headers:{'X-Story-Cloud-Key':'a-test-secret','X-Story-Instance':'one',...headers},body});}
 test('Private checkpoint requires the backend key',async()=>{
  const r=await worker.fetch(request('/internal/snapshot','GET',{'X-Story-Cloud-Key':'wrong'}),env());assert.equal(r.status,403);

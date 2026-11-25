@@ -81,6 +81,8 @@ export default {
   if(url.pathname==='/health'){
    if(!['GET','HEAD'].includes(request.method))return json({detail:'Method not allowed'},405,{Allow:'GET, HEAD'});
    if(!env.BACKEND_URL)return json({ok:false,service:'story-preview',ready:false});
+   const pausedUntil=Number(env.BACKEND_PAUSED_UNTIL);
+   if(Number.isFinite(pausedUntil)&&pausedUntil>Date.now()/1000)return json({ok:false,service:'story-cloud',ready:false,reason:'hosting_monthly_quota',resume_after:pausedUntil},503,{'Retry-After':String(Math.max(1,Math.ceil(pausedUntil-Date.now()/1000)))});
    return healthResponse(await probeHealth(env),request.method==='HEAD');
   }
   if(url.pathname==='/service-health'&&request.method==='GET'){

@@ -16,7 +16,7 @@ async function harness(responder,wakeUrl='',returned=false){
  const timers=new Map(),intervals=new Map(),handlers={},requests=[];
  const frames=[],navigations=[];
  const el=()=>({innerHTML:'',textContent:'',dataset:{},open:false,isConnected:true,contentWindow:{},setAttribute(){},remove(){this.removed=true;},classList:{add(){},remove(){}},replaceChildren(...children){this.innerHTML='';this.textContent=children.map(c=>c.textContent).join('');},append(child){this.textContent+=child.textContent;},addEventListener(){},showModal(){this.open=true;},close(){this.open=false;}});
- const elements={'#app':el(),'#dialog':el(),'#toast':el(),'#people-add-error':el(),'#people-file-error':el()};
+ const elements={'#app':el(),'#dialog':el(),'#toast':el(),'#people-add-error':el(),'#people-file-error':el(),'#profile-about-error':el(),'#profile-channel-error':el(),'#channel-create-error':el()};
  if(wakeUrl)elements['meta[name="story-backend-wake"]']={content:wakeUrl};
  const document={body:{append(frame){frames.push(frame);}},querySelector:selector=>elements[selector]||null,getElementById:id=>elements['#'+id]||null,createElement:()=>el(),querySelectorAll:()=>[],visibilityState:'visible',activeElement:null,
   addEventListener(type,handler){(handlers[type]??=[]).push(handler);}};
@@ -30,13 +30,20 @@ async function harness(responder,wakeUrl='',returned=false){
  await vm.runInContext(source,context);
  async function settle(){for(let i=0;i<12;i++)await new Promise(resolve=>setImmediate(resolve));}
  await settle();
- return {elements,timers,intervals,requests,context,frames,navigations,
+ return {elements,timers,intervals,requests,context,frames,navigations,settle,
+  async submitExisting(form){for(const handler of handlers.submit||[])await handler({target:form,preventDefault(){}});await settle();},
   async retry(){const entry=[...timers.entries()].filter(([,t])=>t.delay!==6500).sort((a,b)=>a[1].due-b[1].due)[0];assert(entry,'Expected a scheduled retry');const [key,timer]=entry;timers.delete(key);clock=Math.max(clock,timer.due);await timer.fn();await settle();},
   async message(event){for(const handler of handlers['window:message']||[])await handler(event);await settle();},
   async visibility(value){document.visibilityState=value;for(const handler of handlers.visibilitychange||[])await handler();await settle();},
   async clickRetry(){const target={dataset:{action:'retry-boot'},disabled:false,isConnected:true};for(const handler of handlers.click||[])await handler({target:{closest:()=>target},preventDefault(){}});await settle();},
-  async clickAction(action){const target={dataset:{action},disabled:false,isConnected:true};for(const handler of handlers.click||[])await handler({target:{closest:()=>target},preventDefault(){}});await settle();},
-  async submitForm(id,fields){const submit={innerHTML:'Добавить',textContent:'Добавить',isConnected:true},fieldset={disabled:false};const form={id,fields,matches:()=>false,querySelector:selector=>selector==='fieldset'?fieldset:submit};for(const handler of handlers.submit||[])await handler({target:form,preventDefault(){}});await settle();return {submit,fieldset};},
+  async clickAction(action,data={}){const target={dataset:{action,...data},disabled:false,isConnected:true};for(const handler of handlers.click||[])await handler({target:{closest:()=>target},preventDefault(){}});await settle();},
+  async submitForm(id,fields,dataset={}){
+   const submit={innerHTML:'Добавить',textContent:'Добавить',isConnected:true,disabled:false},fieldset={disabled:false},saved=el(),error=el();
+   const form={id,fields,dataset,isConnected:true,elements:Object.fromEntries(Object.entries(fields).map(([k,v])=>[k,{value:v,checked:v==='on'}])),
+    matches:selector=>selector==='.profile-form'?id.startsWith('profile-'):selector==='.channel-username-form'?id==='channel-username-form':false,
+    querySelector:selector=>selector==='fieldset'?fieldset:selector==='.profile-saved'?saved:selector==='.inline-error'?error:submit};
+   for(const handler of handlers.submit||[])await handler({target:form,preventDefault(){}});await settle();return {submit,fieldset,form,saved,error};
+  },
   advance(ms){clock+=ms;},
   async poll(){assert.equal(intervals.size,1);await [...intervals.values()][0].fn();},
  };
@@ -44,6 +51,14 @@ async function harness(responder,wakeUrl='',returned=false){
 
 function normal(path){if(path==='/health')return json(healthy);if(path==='/api/auth/me')return json({csrf:'test-csrf'});if(path==='/api/state')return json(emptyState);throw new Error('Unexpected request');}
 function noPreview(h){assert.doesNotMatch(h.elements['#app'].innerHTML,/Предпросмотр интерфейса|Сервер Telegram ещё не запущен/);assert.equal(h.elements['#dialog'].open,false);}
+test('An explicit monthly quota pause stops the cold-start loop and retries after the pause',async()=>{
+ const resumeAfter=Math.floor(Date.now()/1000)+86400;let calls=0;
+ const h=await harness(path=>path==='/health'&&calls++===0?json({ok:false,service:'story-cloud',ready:false,reason:'hosting_monthly_quota',resume_after:resumeAfter},503):normal(path),'https://our-app.onrender.com/wake');
+ assert.match(h.elements['#app'].innerHTML,/Лимит хостинга исчерпан/);assert.equal(h.frames[0].removed,true);
+ assert.equal(h.navigations.length,0);assert.equal(h.requests.length,1);
+ assert([...h.timers.values()][0].delay>86300000);
+ await h.retry();assert.match(h.elements['#app'].innerHTML,/Всё под контролем/);assert.equal(h.navigations.length,0);
+});
 
 test('429 with an HTML response waits for Retry-After without entering preview',async()=>{
  const h=await harness(()=>new Response('<h1>Too many requests</h1>',{status:429,headers:{'Retry-After':'120','Content-Type':'text/html'}}));
@@ -280,4 +295,150 @@ test('User import queue shows its progress and escaped per-user failures',async(
  assert.match(html,/С историями: 12/);assert.match(html,/width:20%/);
  assert.match(html,/Причины пропуска \(7\)/);assert.match(html,/&lt;script&gt;/);
  assert.doesNotMatch(html,/<script>/);assert.match(html,/data-action='job-resume'/);
+});
+
+const owner=(name,user_id)=>({name,user_id,first_name:name,last_name:'',username:'owner_'+user_id,profile_loaded:true,about:'',is_premium:false,created_at:1800000000});
+function scopedState(slot){
+ const accounts=[{...owner('Первый','101'),slot:1},{...owner('Второй','202'),slot:2}];
+ return {...emptyState,accounts,active_account:slot,max_accounts:5,account:accounts.find(a=>a.slot===slot)||null,channels:[]};
+}
+function scopedNormal(path,options){
+ if(path==='/api/state')return json(scopedState(Number(options.headers['X-Story-Account'])));
+ if(path==='/api/account/profile')return json({account:scopedState(Number(options.headers['X-Story-Account'])).account});
+ if(path.startsWith('/api/people?'))return json({people:[],total:0});
+ return normal(path);
+}
+
+test('ZAVOD renders four navigation tabs and five account slots',async()=>{
+ const h=await harness((p,_,o)=>scopedNormal(p,o));
+ const html=h.elements['#app'].innerHTML;
+ assert.match(html,/ZAVOD/);assert.doesNotMatch(html,/лупа|stories workspace|hero-card|Первые шаги/);
+ assert.match(html,/id='account-picker'/);
+ assert.equal((html.match(/<option value='[1-5]'/g)||[]).length,5);
+ const mobile=html.slice(html.indexOf("class='mobile-nav'"));
+ assert.equal((mobile.match(/data-tab=/g)||[]).length,4);
+ assert.match(html,/Premium/);
+ await h.clickAction('go-account');
+ const profile=h.elements['#app'].innerHTML;
+ assert.match(profile,/2 из 5 подключено/);
+ assert.match(profile,/id='profile-about-form'/);
+ assert.match(profile,/id='profile-channel-form'/);
+ assert.match(profile,/id='channel-create-form'/);
+});
+
+test('Account switching clears selection and filters and scopes subsequent writes',async()=>{
+ const h=await harness((p,_,o)=>p==='/api/people'?json({ok:true}):scopedNormal(p,o));
+ vm.runInContext("selected.add('101');source='old-chat';search='old';people=[{user_id:'101'}]",h.context);
+ await h.clickAction('select-account',{slot:'2'});
+ assert.equal(vm.runInContext('accountSlot',h.context),2);
+ assert.equal(vm.runInContext('state.account.name',h.context),'Второй');
+ assert.equal(vm.runInContext("selected.size+':'+source+':'+search+':'+people.length",h.context),'0:::0');
+ await h.submitForm('people-add-form',{username:'@user_two',request_id:'scope-user-request'});
+ const post=h.requests.find(r=>r.path==='/api/people');
+ assert.equal(post.options.headers['X-Story-Account'],'2');
+ assert.equal(post.options.headers['X-CSRF-Token'],'test-csrf');
+ const avatar=vm.runInContext("state.account.has_avatar=true;state.account.photo_revision=8;profileAvatar()",h.context);
+ assert.match(avatar,/account=2&/);
+});
+
+test('A late response from a previous account cannot replace the active state',async()=>{
+ let delayed=false,release;
+ const h=await harness((p,_,o)=>{
+  if(delayed&&p==='/api/state'&&o.headers['X-Story-Account']==='1')return new Promise(resolve=>release=resolve);
+  return scopedNormal(p,o);
+ });
+ delayed=true;const old=vm.runInContext('sync()',h.context);
+ const rejected=assert.rejects(old,err=>err.code==='ACCOUNT_CHANGED');
+ await h.settle();assert.equal(typeof release,'function');
+ await h.clickAction('select-account',{slot:'2'});
+ release(json({...scopedState(1),stats:{people:999}}));await rejected;
+ assert.equal(vm.runInContext('state.account.name',h.context),'Второй');
+ assert.equal(vm.runInContext('state.stats.people',h.context),0);
+});
+
+test('An old JSON body arriving after account selection is rejected',async()=>{
+ let delayed=false,release;
+ const h=await harness((p,_,o)=>{
+  if(delayed&&p==='/api/state'&&o.headers['X-Story-Account']==='1')return {ok:true,status:200,json:()=>new Promise(resolve=>release=resolve)};
+  return scopedNormal(p,o);
+ });
+ delayed=true;const old=vm.runInContext('sync()',h.context);
+ const rejected=assert.rejects(old,err=>err.code==='ACCOUNT_CHANGED');
+ await h.settle();await h.clickAction('select-account',{slot:'2'});
+ release(scopedState(1));await rejected;
+ assert.equal(vm.runInContext('state.account.name',h.context),'Второй');
+});
+
+test('An account mutation holds the selection until its result is received',async()=>{
+ let release;
+ const h=await harness((p,_,o)=>p==='/api/account/profile/about'?new Promise(resolve=>release=resolve):scopedNormal(p,o));
+ const pending=vm.runInContext("api('/api/account/profile/about',{method:'POST',body:{about:'Описание'}})",h.context);
+ await h.settle();await h.clickAction('select-account',{slot:'2'});
+ assert.equal(vm.runInContext('accountSlot',h.context),1);
+ release(json({account:owner('Первый','101')}));await pending;
+ await h.clickAction('select-account',{slot:'2'});
+ assert.equal(vm.runInContext('accountSlot',h.context),2);
+});
+
+test('Five occupied slots prevent opening a sixth account',async()=>{
+ const h=await harness(normal);
+ vm.runInContext("state.accounts=Array.from({length:5},(_,i)=>({slot:i+1,name:'Аккаунт '+(i+1)}));page='account';render()",h.context);
+ assert.match(h.elements['#app'].innerHTML,/5 из 5 подключено/);
+ assert.match(h.elements['#app'].innerHTML,/data-action='add-account' disabled/);
+ const before=h.requests.length;await h.clickAction('add-account');
+ assert.equal(h.requests.length,before);
+ assert.match(h.elements['#toast'].textContent,/до пяти аккаунтов/);
+});
+
+test('Bio and personal channel forms save to the selected account and show canonical values',async()=>{
+ const h=await harness((p,_,o)=>{
+  if(p==='/api/account/profile/about')return json({account:{...owner('Второй','202'),about:'Каноническое био'}});
+  if(p==='/api/account/profile/channel')return json({account:{...owner('Второй','202'),personal_channel:{id:'42',title:'Канал',username:'my_channel'}}});
+  return scopedNormal(p,o);
+ });
+ await h.clickAction('select-account',{slot:'2'});
+ const bio=await h.submitForm('profile-about-form',{about:'Новое био'});
+ assert.equal(bio.form.elements.about.value,'Каноническое био');assert.match(bio.saved.textContent,/Сохранено/);
+ const channel=await h.submitForm('profile-channel-form',{ref:'@my_channel'});
+ assert.equal(channel.form.elements.ref.value,'@my_channel');
+ for(const p of ['/api/account/profile/about','/api/account/profile/channel']){
+  const req=h.requests.find(r=>r.path===p);
+  assert.equal(req.options.headers['X-Story-Account'],'2');assert.equal(req.options.headers['X-CSRF-Token'],'test-csrf');
+ }
+});
+
+test('Channel retry keeps the creation identity and partial success is escaped',async()=>{
+ let attempts=0;
+ const h=await harness((p,_,o)=>{
+  if(p==='/api/account/channels')return ++attempts===1?json({detail:'Занято'},409):json({channel:{id:'42',title:'<script>Канал</script>',username:'my_channel'},pinned:false,warning:'<img src=x> закрепите отдельно',replayed:true});
+  return scopedNormal(p,o);
+ });
+ const fields={request_id:'channel-request-stable-123',title:'Канал',username:'@my_channel',about:'Описание',pin:'on'};
+ await h.submitForm('channel-create-form',fields);await h.submitForm('channel-create-form',fields);
+ const posts=h.requests.filter(r=>r.path==='/api/account/channels');assert.equal(posts.length,2);
+ assert(posts.every(r=>JSON.parse(r.options.body).request_id===fields.request_id));assert.equal(JSON.parse(posts[1].options.body).pin,true);
+ const html=h.elements['#dialog'].innerHTML;
+ assert.match(html,/&lt;script&gt;/);assert.match(html,/&lt;img/);assert.doesNotMatch(html,/<script>|<img src=x>/);assert.match(html,/Повторный канал не создан/);
+});
+
+test('An uncertain channel creation disables resubmitting the same form',async()=>{
+ const h=await harness((p,_,o)=>p==='/api/account/channels'?json({detail:'Результат не подтверждён',code:'CHANNEL_CREATE_UNCERTAIN'},409):scopedNormal(p,o));
+ const first=await h.submitForm('channel-create-form',{request_id:'channel-uncertain-123',title:'Канал',username:'my_channel',about:''});
+ assert.equal(first.form.dataset.uncertain,'true');assert.equal(first.submit.disabled,true);
+ await h.submitExisting(first.form);assert.equal(h.requests.filter(r=>r.path==='/api/account/channels').length,1);
+});
+
+test('Channel username edits use the selected account and stored channel ID',async()=>{
+ const h=await harness((p,_,o)=>p==='/api/account/channels/42/username'?json({account:owner('Второй','202')}):scopedNormal(p,o));
+ await h.clickAction('select-account',{slot:'2'});
+ await h.submitForm('channel-username-form',{username:'new_channel'},{channel:'42'});
+ const req=h.requests.find(r=>r.path==='/api/account/channels/42/username');
+ assert.equal(req.options.headers['X-Story-Account'],'2');assert.deepEqual(JSON.parse(req.options.body),{username:'new_channel'});
+});
+
+test('View confirmation describes Premium policy and jobs show acknowledged reaction totals',async()=>{
+ const h=await harness(normal);vm.runInContext("selected.add('123');viewDialog()",h.context);
+ assert.match(h.elements['#dialog'].innerHTML,/Premium/);assert.match(h.elements['#dialog'].innerHTML,/👍/);
+ const html=vm.runInContext("jobCard({id:'v',kind:'view',status:'done',viewed:3,reacted:2,checked:3,total:3})",h.context);
+ assert.match(html,/Просмотров: 3 · Реакций: 2/);
 });
