@@ -22,6 +22,8 @@ from pydantic import BaseModel, Field
 from .archive import ArchiveError, MAX_UPLOAD, extract_tdata
 from .config import Config
 from .db import DB, now
+from .accounts import AccountHub, MAX_ACCOUNTS
+from .accounts import AccountHub, MAX_ACCOUNTS
 from .telegram import TelegramError, TelegramGateway, normalize_chat, api_credentials
 from .worker import VIEW_LIMIT_24H, Worker
 from .snapshot import SnapshotStore, SnapshotError
@@ -115,11 +117,15 @@ class UsernameInput(BaseModel):
 def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
     config=config or Config.from_env()
     config.validate()
-    db=DB(config.data_dir/'story-cloud.sqlite3')
     cipher=config.cipher()
-    gateway=gateway_factory(db,cipher)
-    storage=SnapshotStore(db,config) if config.snapshot_site_url else None
-    worker=Worker(db,gateway,storage)
+    hub=AccountHub(config.data_dir/'story-cloud.sqlite3',cipher,gateway_factory,Worker,
+                   (lambda root:SnapshotStore(root,config)) if config.snapshot_site_url else None)
+    db=hub.proxy('databases')
+    gateway=hub.proxy('gateways')
+    storage=hub.storage
+    worker=hub.workers[1]
+    for item in hub.gateways.values():
+        item.account_lookup=hub.find_user
     # An unprivileged readiness document may be embedded only by the configured
     # panel. The return URL is configuration, never a visitor-supplied URL.
     try:
@@ -135,25 +141,27 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
 
     @asynccontextmanager
     async def lifespan(app):
-        storage_task=asyncio.create_task(storage.run(gateway.close)) if storage else None
-        task=asyncio.create_task(worker.run()) if run_worker else None
+        storage_task=asyncio.create_task(storage.run(hub.close)) if storage else None
+        tasks=[asyncio.create_task(item.run()) for item in hub.workers.values()] if run_worker else []
         try:
             yield
         finally:
-            if task:
+            for task in tasks:
                 task.cancel()
+            for task in tasks:
                 with suppress(asyncio.CancelledError):
                     await task
-            await gateway.close()
+            await hub.close()
             if storage_task:
                 storage_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await storage_task
                 await storage.close()
 
-    app=FastAPI(title='Лупа',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
-    app.state.db=db
-    app.state.gateway=gateway
+    app=FastAPI(title='ZAVOD 1.0',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
+    app.state.hub=hub
+    app.state.db=hub.databases[1]
+    app.state.gateway=hub.gateways[1]
     app.state.worker=worker
     app.state.storage=storage
     app.add_middleware(BodyLimitMiddleware)
@@ -185,6 +193,20 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
         if config.cookie_secure:
             response.headers['Strict-Transport-Security']='max-age=31536000'
         return response
+
+    @app.middleware('http')
+    async def account_context(request,call_next):
+        raw=request.headers.get('x-story-account')
+        if raw is None and request.method in ('GET','HEAD') and request.url.path=='/api/account/profile/photo':
+            raw=request.query_params.get('account')
+        raw=raw or '1'
+        if not re.fullmatch(r'[1-5]',raw):
+            return JSONResponse({'detail':'Выберите аккаунт от 1 до 5.'},status_code=400)
+        token=hub.bind(int(raw))
+        try:
+            return await call_next(request)
+        finally:
+            hub.reset(token)
 
     def check_origin(request):
         origin=request.headers.get('origin')
@@ -258,6 +280,10 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
         response.delete_cookie(COOKIE,path='/',secure=config.cookie_secure,httponly=True,samesite='strict')
         return {'ok':True}
 
+    @app.get('/api/accounts')
+    def accounts(login=Depends(authenticated)):
+        return {'accounts':hub.public_accounts(),'active_account':db.slot,'max_accounts':MAX_ACCOUNTS}
+
     @app.get('/api/state')
     def state(login=Depends(authenticated)):
         counts=db.one("SELECT COUNT(*) people,COALESCE(SUM(EXISTS(SELECT 1 FROM json_each(p.stories) s WHERE json_extract(s.value,'$.expires')>?)),0) active FROM people p",(now(),))
@@ -283,7 +309,8 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                            SUM(j.status='done') done,SUM(j.status='failed') failed,SUM(j.status='cancelled') cancelled
                            FROM source_imports i JOIN source_import_jobs ij ON ij.import_id=i.id
                            JOIN jobs j ON j.id=ij.job_id GROUP BY i.id ORDER BY i.created_at DESC,i.rowid DESC LIMIT 5''')
-        return {'account':db.public_account(),
+        return {'account':db.public_account(),'accounts':hub.public_accounts(),
+                'active_account':db.slot,'max_accounts':MAX_ACCOUNTS,'accounts':hub.public_accounts(),'active_account':db.slot,'max_accounts':MAX_ACCOUNTS,
                 'sources':sources,'jobs':jobs,'events':db.all('SELECT * FROM events ORDER BY id DESC LIMIT 50'),
                 'job_counts':job_counts,'job_total':sum(job_counts.values()),'source_imports':imports,
                 'stats':{'people':counts['people'],'active':counts['active'],'views_24h':db.one('SELECT COUNT(*) n FROM views WHERE viewed_at>?',(now()-86400,))['n']},
@@ -293,14 +320,18 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                 'auth_mode':'chatgpt' if config.bridge_secret else 'password',
                 'free_mode':config.free_mode,'storage_error':storage.error if storage else ''}
 
+    @app.get('/api/accounts')
+    def accounts(login=Depends(authenticated)):
+        return {'accounts':hub.public_accounts(),'active_account':db.slot,'max_accounts':MAX_ACCOUNTS}
+
     @app.post('/api/account/tdata')
     async def import_tdata(request: Request,file: UploadFile=File(...),api_id: int=Form(0),
                            api_hash: str=Form(''),passcode: str=Form(''),password: str=Form(''),
                            login=Depends(authenticated)):
         if db.account():
             raise HTTPException(409,'Сначала отключите текущий аккаунт.')
-        if gateway.lock.locked():
-            raise HTTPException(409,'Другое действие ещё выполняется. Попробуйте позже.')
+        if gateway.lock.locked() or hub.import_lock.locked():
+            raise HTTPException(409,'Другое действие или импорт ещё выполняется. Попробуйте позже.')
         try:
             api_id,api_hash=api_credentials(config,api_id,api_hash)
         except TelegramError as exc:
@@ -309,7 +340,7 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
             raise HTTPException(400,'Слишком длинный пароль.')
         stage = 'archive_read'
         try:
-            async with gateway.lock:
+            async with hub.import_lock, gateway.lock:
                 check_telegram_cooldown()
                 if storage:
                     await storage.flush()
@@ -446,7 +477,7 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                 c.execute('DELETE FROM source_imports')
                 c.execute('DELETE FROM people_imports')
             db.event('Аккаунт отключён. Локальные данные сессии и аудитории удалены.')
-        return {'ok':True,'revoked':revoked,'message':('Облачная сессия завершена.' if revoked else 'Данные удалены. Завершите сессию Story Cloud в настройках Telegram, если она осталась активной.')}
+        return {'ok':True,'revoked':revoked,'message':('Облачная сессия завершена.' if revoked else 'Данные удалены. Завершите сессию ZAVOD 1.0 в настройках Telegram, если она осталась активной.')}
 
     @app.post('/api/sources')
     def add_source(body: SourceInput,login=Depends(authenticated)):

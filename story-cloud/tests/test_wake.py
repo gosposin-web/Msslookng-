@@ -37,6 +37,7 @@ def test_startup_document_remains_available_during_checkpoint_restore(tmp_path,m
     class RestoringStorage:
         ready=False
         def __init__(self,*args): pass
+        def changed(self): pass
         async def run(self,*args): await asyncio.Event().wait()
         async def close(self): pass
     monkeypatch.setattr('app.main.SnapshotStore',RestoringStorage)

@@ -45,7 +45,7 @@ def create_cloud_client(session, api_id, api_hash, *, receive_updates):
     # opentele patches Telethon's constructor globally and adds an `api` argument
     # before api_id. Positional credentials silently turn api_hash into an int.
     return TelegramClient(session,api_id=api_id,api_hash=api_hash,
-        device_model='Story Cloud',system_version='Cloud Linux',app_version='1.0',
+        device_model='ZAVOD 1.0',system_version='Cloud Linux',app_version='1.0',
         receive_updates=receive_updates,flood_sleep_threshold=0,request_retries=0,
         connection_retries=1,retry_delay=1,timeout=10)
 
@@ -188,6 +188,10 @@ class TelegramGateway:
             await desktop_client.connect()
             self.import_stage = 'desktop_check'
             original = await inspect_account(desktop_client)
+            existing=getattr(self,'account_lookup',lambda uid:None)(original.id)
+            if existing:
+                raise AccountAccessError('ACCOUNT_ALREADY_CONNECTED','Этот Telegram-аккаунт уже подключён.',
+                                         'Выберите его в списке аккаунтов.')
             self.import_stage = 'cloud_session'
             client = create_cloud_client(StringSession(),api_id,api_hash,receive_updates=True)
             self.import_stage = 'cloud_connect'

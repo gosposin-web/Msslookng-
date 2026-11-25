@@ -135,7 +135,7 @@ export default {
    if(!['GET','HEAD','OPTIONS'].includes(request.method)&&incomingOrigin&&incomingOrigin!==url.origin)return json({detail:'Запрос с другого сайта отклонён.'},403);
    // Never forward the Site's sign-in cookies, bearer tokens or other visitor headers.
    const headers=new Headers();
-   for(const name of ['accept','content-type','content-length','x-csrf-token','if-none-match'])if(request.headers.has(name))headers.set(name,request.headers.get(name));
+   for(const name of ['accept','content-type','content-length','x-csrf-token','x-story-account','if-none-match'])if(request.headers.has(name))headers.set(name,request.headers.get(name));
    headers.set('X-Story-Bridge-Secret',env.STORY_BRIDGE_SECRET);
    headers.set('X-Story-User',user);
    headers.set('Origin',url.origin);
