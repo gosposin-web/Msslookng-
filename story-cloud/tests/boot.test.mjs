@@ -6,7 +6,7 @@ import {webcrypto} from 'node:crypto';
 
 const source=await readFile(new URL('../app/static/app.js',import.meta.url),'utf8');
 const healthy={ok:true,service:'story-cloud',ready:true};
-const emptyState={account:null,sources:[],jobs:[],events:[],stats:{people:0,active:0,views_24h:0},view_limit_24h:200};
+const emptyState={account:null,accounts:[],active_account:1,max_accounts:5,sources:[],jobs:[],events:[],stats:{people:0,active:0,views_24h:0},view_limit_24h:200};
 const json=(data,status=200,headers={})=>Response.json(data,{status,headers});
 
 // Run the actual browser script with a small DOM boundary and a controllable clock.
@@ -51,6 +51,11 @@ async function harness(responder,wakeUrl='',returned=false){
 
 function normal(path){if(path==='/health')return json(healthy);if(path==='/api/auth/me')return json({csrf:'test-csrf'});if(path==='/api/state')return json(emptyState);throw new Error('Unexpected request');}
 function noPreview(h){assert.doesNotMatch(h.elements['#app'].innerHTML,/Предпросмотр интерфейса|Сервер Telegram ещё не запущен/);assert.equal(h.elements['#dialog'].open,false);}
+test('An older backend cannot expose multiaccount controls or modify the wrong account',async()=>{
+ const h=await harness(path=>path==='/api/state'?json({...emptyState,max_accounts:undefined,accounts:undefined}):normal(path),'https://our-app.onrender.com/wake');
+ assert.match(h.elements['#app'].innerHTML,/Ожидаем обновления сервера/);assert.doesNotMatch(h.elements['#app'].innerHTML,/account-picker/);
+ assert.equal(h.intervals.size,0);assert.equal(h.frames[0].removed,true);assert.equal(h.navigations.length,0);
+});
 test('An explicit monthly quota pause stops the cold-start loop and retries after the pause',async()=>{
  const resumeAfter=Math.floor(Date.now()/1000)+86400;let calls=0;
  const h=await harness(path=>path==='/health'&&calls++===0?json({ok:false,service:'story-cloud',ready:false,reason:'hosting_monthly_quota',resume_after:resumeAfter},503):normal(path),'https://our-app.onrender.com/wake');

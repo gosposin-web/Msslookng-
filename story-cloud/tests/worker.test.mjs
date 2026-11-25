@@ -24,6 +24,7 @@ test('A known monthly hosting pause is explicit and makes no upstream request',a
  try{
   const r=await worker.fetch(new Request('https://private.test/health'),e);
   assert.equal(r.status,503);assert.equal((await r.json()).reason,'hosting_monthly_quota');assert.equal(calls,0);assert(Number(r.headers.get('retry-after'))>86390);
+  const head=await worker.fetch(new Request('https://private.test/health',{method:'HEAD'}),e);assert.equal(head.status,503);assert.equal(await head.text(),'');
  }finally{globalThis.fetch=previous;}
 });
 test('Proxy forwards the selected account without forwarding visitor credentials',async()=>{

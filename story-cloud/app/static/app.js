@@ -189,7 +189,8 @@ function addSource(){showDialog(dialogTitle('Добавить чат')+`<p>Ук�
 function importChats(){showDialog(dialogTitle('Чаты из файла')+`<p>TXT или CSV, до 200 уникальных чатов и 512 КБ. В TXT укажите один чат на строку. В CSV можно использовать столбец «Ссылка», username или chat_id.</p><pre class='chat-file-example'>https://t.me/my_group_01\n@my_group_02\n-1001234567890</pre><form id='chat-file-form'><fieldset><input type='hidden' name='request_id' value='${crypto.randomUUID()}'><label class='field'><span>Файл со списком чатов</span><input type='file' name='file' accept='.txt,.csv,text/plain,text/csv' required></label><label class='field'><span>Кого собирать в каждом чате</span><select name='mode'><option value='members'>Участники группы</option><option value='authors'>Авторы сообщений</option></select></label><label class='field'><span>Лимит людей на каждый чат</span><input type='number' name='max_users' value='300' inputmode='numeric' min='1' max='5000' required></label><label class='mode-choice'><input type='checkbox' name='start_scans' ${state.account?'checked':'disabled'}><span><strong>Запустить сбор после добавления</strong><small>${state.account?'Для каждого доступного чата создаётся отдельное задание.':'Для запуска сначала подключите Telegram-аккаунт. Чаты можно добавить заранее.'}</small></span></label><p class='file-import-note'>Повторы не создают новые чаты. Для чата с незавершённым сбором второе задание не запускается. Ошибки отдельных строк покажем в отчёте; доступность групп проверяется при сборе. Настройки применяются к чатам без действующего сбора.</p><div id='chat-file-error' class='inline-error' role='alert'></div><div class='dialog-actions'>${button('close-dialog','Отмена','light')}<button class='btn primary' type='submit'>${state.account?'Добавить и запустить сбор':'Добавить чаты'}</button></div></fieldset></form>`);}
 function importResult(r){showDialog(dialogTitle('Файл обработан')+`<div class='import-result' role='status'><p><strong>Новых чатов: ${number(r.added)}.</strong> Уже были в панели: ${number(r.existing)}.</p><p>Поставлено заданий: <strong>${number(r.queued)}</strong>. Уже есть незавершённый сбор: ${number(r.busy)}.</p><p>Повторов в файле: ${number(r.duplicates)}. Неверных записей: ${number(r.invalid_count)}.</p>${r.replayed?'<p>Этот запрос уже был выполнен. Повторные задания не созданы.</p>':''}</div>${r.invalid_count?`<details class='import-errors' open><summary>Пропущенные записи</summary><ul>${r.invalid_rows.map(row=>`<li>Строка ${row.line}: <code>${esc(row.value||'пустое поле')}</code><br>${esc(row.message)}</li>`).join('')}</ul>${r.invalid_count>r.invalid_rows.length?`<p>Показаны первые ${r.invalid_rows.length} ошибок.</p>`:''}</details>`:''}<div class='dialog-actions'>${button('close-dialog','Закрыть','light')}${button(r.queued?'go-jobs':'go-sources',r.queued?'Открыть очередь':'Открыть чаты','primary')}</div>`);}
 function viewDialog(){if(!selected.size)return;showDialog(dialogTitle('Смотреть выбранные истории')+`<p>Выбрано пользователей: <strong>${number(selected.size)}</strong>. Перед просмотром доступность историй будет проверена повторно. Уже просмотренные истории пропускаются. Если у автора Premium, только просмотр; без Premium — просмотр и 👍. Неизвестный статус — без реакции.</p><form id='view-form'><label class='field'><span>Интервал между пользователями, сек.</span><input name='delay' type='number' inputmode='numeric' min='5' max='300' value='15' required><small>Внутренний предел приложения — ${state.view_limit_24h} историй за 24 часа. Запросы ожидания Telegram имеют приоритет.</small></label><div class='inline-error' id='view-error' role='alert'></div><div class='dialog-actions'>${button('close-dialog','Отмена','light')}<button class='btn primary' type='submit'>${icon('play')}Запустить</button></div></form>`);}
-async function sync(renderAfter=true){if(!server||!authenticated)return;state=await api('/api/state');if(page==='audience')await loadPeople();else if(renderAfter)render();}
+function verifyServerState(value){if(value?.max_accounts!==5||!Array.isArray(value.accounts)||Number(value.active_account)!==accountSlot)throw Object.assign(new Error('Новая серверная версия ещё не запущена.'),{status:503,code:'SERVER_UPDATE_REQUIRED'});return value;}
+async function sync(renderAfter=true){if(!server||!authenticated)return;state=verifyServerState(await api('/api/state'));if(page==='audience')await loadPeople();else if(renderAfter)render();}
 async function loadPeople(){if(!server||!authenticated){people=[];totalPeople=0;renderPeople();return;}const request=++peopleRequest;const q=new URLSearchParams({search,source,active:String(activeOnly),offset:String(offset)});const d=await api('/api/people?'+q);if(request!==peopleRequest)return;people=d.people;totalPeople=d.total;renderPeople();}
 async function go(next){if(avatarPreview){URL.revokeObjectURL(avatarPreview);avatarPreview='';}page=next;if(next==='audience'){render();await loadPeople();}else render();window.scrollTo({top:0,behavior:'instant'});if(next==='account'&&state.account)await refreshProfile();}
 dialog.addEventListener('cancel',e=>{if(dialog.dataset.login==='true')e.preventDefault();});
@@ -375,6 +376,12 @@ function hostingPause(resumeAfter){
  app.innerHTML=`<div class='boot connection-state' data-connection-state='hosting-quota'><span class='brand-mark'>Z</span><h1>Лимит хостинга исчерпан</h1><p>Render приостановил сервер из-за месячной квоты бесплатного размещения. Постоянное обновление страницы его не запустит.</p><p class='connection-retry' role='status'>Новая автоматическая проверка: ${esc(date(bootRetryAt/1000))}.</p></div>`;
  scheduleBoot();
 }
+function backendUpdatePending(){
+ stopBackendWake();backendWakeAttempted=false;backendWakeStartedAt=0;backendWakeConfirmed=false;backendWakeUrl=null;server=false;
+ connectionPending=true;bootRetryAt=Date.now()+60000;
+ app.innerHTML=`<div class='boot connection-state' data-connection-state='backend-update'><span class='brand-mark'>Z</span><h1>Ожидаем обновления сервера</h1><p>Интерфейс ZAVOD 1.0 опубликован. Новая серверная версия ещё не запущена после остановки хостинга. Проверим снова автоматически.</p></div>`;
+ scheduleBoot();
+}
 function startPolling(){
  if(pollTimer!==null)return;
  pollTimer=setInterval(async()=>{
@@ -408,9 +415,10 @@ async function boot(){
    const d=await api('/api/auth/me',{authPrompt:false});
    csrf=d.csrf;
    const nextState=await api('/api/state',{authPrompt:false});
-   state=nextState;authenticated=true;
+   state=verifyServerState(nextState);authenticated=true;
   }catch(err){
    authenticated=false;
+   if(err.code==='SERVER_UPDATE_REQUIRED'){backendUpdatePending();return;}
    if(err.status===401){connectionPending=false;stopBackendWake();render();showLogin();startPolling();return;}
    connectionIssue(err.status||0,err.status===429?err.retryAfter:undefined);return;
   }
