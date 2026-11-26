@@ -12,6 +12,9 @@ from pathlib import Path
 
 import httpx
 
+from .checkpoint_codec import (MAX_DATABASE, MAX_PATCH, MAX_PATCHES, MAX_WIRE,
+                               apply_patch, encode_patch, unpack_frames)
+
 
 class SnapshotError(RuntimeError):
     pass
@@ -35,6 +38,11 @@ class SnapshotStore:
         self.lock=asyncio.Lock()
         self.deadline=0
         self.restore_generation=0
+        self.supports_patches=False
+        self.last_snapshot=None
+        self.patch_count=0
+        self.chain_bytes=0
+        self.base_bytes=0
         self.db.on_change=self.changed
 
     def changed(self):
@@ -62,7 +70,7 @@ class SnapshotStore:
         self.deadline=deadline
         return True
 
-    def _snapshot(self):
+    def _snapshot_data(self):
         # SQLite backup captures the WAL consistently, then produces a self-contained file.
         with tempfile.TemporaryDirectory(prefix='story-checkpoint-') as folder:
             path=Path(folder)/'state.sqlite3'
@@ -74,27 +82,39 @@ class SnapshotStore:
             finally:
                 target.close()
             data=path.read_bytes()
-        if len(data)>32*1024*1024:
+        if len(data)>MAX_DATABASE:
             raise SnapshotError('База превысила размер бесплатного режима.')
-        return self.cipher.encrypt(zlib.compress(data,level=3))
+        return data
+
+    def _snapshot(self):
+        return self.cipher.encrypt(zlib.compress(self._snapshot_data(),level=3))
+
+    def _decrypt_frame(self,frame,limit):
+        compressed=self.cipher.decrypt(frame)
+        decoder=zlib.decompressobj()
+        data=decoder.decompress(compressed,limit+1)
+        if len(data)>limit or not decoder.eof or decoder.unused_data:
+            raise ValueError('Invalid checkpoint size')
+        return data
 
     async def restore(self):
         response=await self._request('GET','/internal/snapshot')
+        self.supports_patches=response.headers.get('X-Story-Snapshot-Codec')=='sqlite-pages-v1'
         if response.status_code==404:
             self.etag=None
+            self.last_snapshot=None
+            self.patch_count=self.chain_bytes=self.base_bytes=0
             self.restore_generation+=1
             return
-        if response.status_code!=200 or len(response.content)>16*1024*1024:
+        if response.status_code!=200 or len(response.content)>MAX_WIRE:
             raise SnapshotError('Не удалось прочитать облачное сохранение.')
         if not response.headers.get('etag'):
             raise SnapshotError('Хранилище не передало версию сохранения. Восстановление приостановлено.')
         try:
-            encrypted=response.content
-            compressed=self.cipher.decrypt(encrypted)
-            decoder=zlib.decompressobj()
-            data=decoder.decompress(compressed,32*1024*1024+1)
-            if len(data)>32*1024*1024 or not decoder.eof or decoder.unused_data:
-                raise ValueError('Invalid checkpoint size')
+            frames=unpack_frames(response.content)
+            data=self._decrypt_frame(frames[0],MAX_DATABASE)
+            for frame in frames[1:]:
+                data=apply_patch(data,self._decrypt_frame(frame,MAX_PATCH))
             if not data.startswith(b'SQLite format 3\x00'):
                 raise ValueError('Invalid checkpoint')
             with tempfile.TemporaryDirectory(prefix='story-restore-') as folder:
@@ -111,6 +131,10 @@ class SnapshotStore:
                     source.close()
             self.db.initialize_schema()
             self.etag=response.headers['etag']
+            self.last_snapshot=data
+            self.patch_count=len(frames)-1
+            self.base_bytes=len(frames[0])
+            self.chain_bytes=len(response.content)
             self.restore_generation+=1
         except Exception:
             raise SnapshotError('Сохранение не расшифровано. Проверьте постоянный ключ сервера.') from None
@@ -122,10 +146,37 @@ class SnapshotStore:
             if self.saved==self.revision:
                 return
             revision=self.revision
-            payload=self._snapshot()
+            data=self._snapshot_data()
+            if data==self.last_snapshot:
+                self.saved=revision
+                return
+            method='PUT'
+            payload=None
+            if self.supports_patches and self.last_snapshot is not None and self.etag and self.patch_count<MAX_PATCHES:
+                patch=encode_patch(self.last_snapshot,data)
+                if patch is not None:
+                    candidate=self.cipher.encrypt(zlib.compress(patch,level=3))
+                    if len(candidate)<self.base_bytes*0.8 and self.chain_bytes+len(candidate)+9<min(MAX_WIRE,self.base_bytes*4):
+                        payload=candidate
+                        method='PATCH'
+            if payload is None:
+                payload=self.cipher.encrypt(zlib.compress(data,level=3))
+            if len(payload)>MAX_WIRE:
+                raise SnapshotError('Сохранение превысило размер облачного хранилища.')
             headers={'Content-Type':'application/octet-stream'}
             headers['If-Match' if self.etag else 'If-None-Match']=self.etag or '*'
-            response=await self._request('PUT','/internal/snapshot',content=payload,headers=headers)
+            if method=='PATCH':
+                headers['X-Story-Snapshot-Codec']='sqlite-pages-v1'
+            response=await self._request(method,'/internal/snapshot',content=payload,headers=headers)
+            if method=='PATCH' and response.status_code==413:
+                # The rejected append did not commit; the same ETag safely guards
+                # a compact full checkpoint if the server's chain bound was hit.
+                method='PUT'
+                payload=self.cipher.encrypt(zlib.compress(data,level=3))
+                if len(payload)>MAX_WIRE:
+                    raise SnapshotError('Сохранение превысило размер облачного хранилища.')
+                headers.pop('X-Story-Snapshot-Codec',None)
+                response=await self._request(method,'/internal/snapshot',content=payload,headers=headers)
             if response.status_code in (409,412):
                 self.ready=False
                 raise SnapshotError('Сохранение занято другим экземпляром сервера. Задания приостановлены.')
@@ -134,6 +185,14 @@ class SnapshotStore:
             if not response.headers.get('etag'):
                 raise SnapshotError('Хранилище не подтвердило версию сохранения. Повторяем запись.')
             self.etag=response.headers['etag']
+            self.last_snapshot=data
+            if method=='PATCH':
+                self.patch_count+=1
+                self.chain_bytes+=len(payload)+9
+            else:
+                self.patch_count=0
+                self.base_bytes=self.chain_bytes=len(payload)
+            self.supports_patches=response.headers.get('X-Story-Snapshot-Codec')=='sqlite-pages-v1'
             self.saved=revision
             self.error=''
 

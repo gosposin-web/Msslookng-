@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 
 from .archive import ArchiveError, MAX_UPLOAD, extract_tdata
@@ -181,6 +182,7 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
     app.state.worker=worker
     app.state.storage=storage
     app.add_middleware(BodyLimitMiddleware)
+    app.add_middleware(GZipMiddleware,minimum_size=1024,compresslevel=6)
 
     @app.middleware('http')
     async def headers(request,call_next):
