@@ -168,3 +168,23 @@ async def test_database_failure_after_view_keeps_intent_and_pauses(setup,monkeyp
     other=db.create_job('view',{'user_ids':['11111'],'position':0,'delay':5})
     await tick(db,worker)
     assert len(gateway.calls)==1
+
+
+def test_restart_resumes_only_safe_masslook_reads_and_keeps_pauses_and_intents(setup):
+    _,db,gateway,worker,config=setup
+    account(db,config)
+    jobs={}
+    for label,phase,status in [('gather','gather','running'),('check','check','running'),
+                               ('view','view','running'),('reactions','reactions','running'),
+                               ('user_pause','gather','paused'),('wait','gather','waiting')]:
+        jid=db.create_job('masslook',{'phase':phase,'user_ids':[],'position':0})
+        db.update_job(jid,status=status,next_run=now()+99);jobs[label]=jid
+    uncertain=db.create_job('masslook',{'phase':'check','uncertain':{'user_id':'10000','story_ids':[7]}})
+    db.update_job(uncertain,status='running')
+    legacy=db.create_job('view',{'user_ids':[],'position':0});db.update_job(legacy,status='running')
+    db.recover()
+    assert all(db.job(jobs[label])['status']=='queued' for label in ('gather','check'))
+    assert all(db.job(jobs[label])['status']=='paused' for label in ('view','reactions','user_pause'))
+    assert db.job(jobs['wait'])['status']=='waiting' and db.job(jobs['wait'])['next_run']>now()
+    assert db.job(uncertain)['status']=='paused' and db.job(uncertain)['payload']['uncertain']
+    assert db.job(legacy)['status']=='paused' and gateway.calls==[]

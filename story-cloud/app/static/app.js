@@ -39,6 +39,9 @@ let toastTimer;
 let profileLoading=false,profileBusy=false,avatarPreview='';
 let jobsShown=40;
 let proxyData={rows:[],total:0,loaded:false},proxyRequest=0;
+const readCache=new Map();
+let readGeneration=0;
+function invalidateReads(){readCache.clear();readGeneration++;}
 let accountSlot=1,accountEpoch=0,accountWrites=0,peopleRequest=0;
 try{const saved=window.localStorage?.getItem('zavod.active_account');if(/^(?:[1-9]|1[0-5])$/.test(saved||''))accountSlot=Number(saved);}catch{}
 function connectedAccounts(){return Array.isArray(state.accounts)?state.accounts:(state.account?[{...state.account,slot:accountSlot}]:[]);}
@@ -51,10 +54,11 @@ async function selectAccount(value){
  if(next===accountSlot){await go('account');return;}
  const accounts=connectedAccounts();if(!accounts.some(a=>Number(a.slot)===next))page='account';
  accountSlot=next;accountEpoch++;peopleRequest++;proxyRequest++;proxyData={rows:[],total:0,loaded:false};clearTimeout(searchTimer);
+ invalidateReads();
  if(dialog.open&&dialog.dataset.login!=='true')dialog.close();
  try{window.localStorage?.setItem('zavod.active_account',String(next));}catch{}
  if(avatarPreview){URL.revokeObjectURL(avatarPreview);avatarPreview='';}
- state={...state,account:null,proxy:null,accounts,sources:[],jobs:[],events:[],channels:[],source_imports:[],job_counts:{},stats:{people:0,active:0,views_24h:0},cooldown_until:0};
+ state={...state,account:null,proxy:null,accounts,sources:[],jobs:[],events:[],channels:[],source_imports:[],job_counts:{},queue_pause:null,stats:{people:0,active:0,views_24h:0},cooldown_until:0};
  selected.clear();people=[];totalPeople=0;offset=0;source='';search='';activeOnly=true;jobsShown=40;profileLoading=false;render();
  try{await sync();if(page==='account'){await loadProxies();if(state.account)await refreshProfile();}}
  catch(err){if(err.code!=='ACCOUNT_CHANGED')toast(err.message||'Не удалось загрузить аккаунт. Нажмите «Обновить».');}
@@ -64,18 +68,28 @@ function toast(message){if(!message)return;const el=document.querySelector('#toa
 function online(){if(server&&authenticated)return true;toast(server?'Войдите в панель.':'Сервер Telegram ещё не запущен. Сейчас доступен просмотр интерфейса.');return false;}
 async function api(path,options={}){
  const slot=accountSlot,epoch=accountEpoch,writing=!!options.method&&!['GET','HEAD','OPTIONS'].includes(options.method);
+ const cacheable=(!options.method||options.method==='GET')&&(path==='/api/state'||path==='/api/people'||path.startsWith('/api/people?'));
+ const cacheKey=slot+':'+path,generation=readGeneration,cached=cacheable?readCache.get(cacheKey):null;
  const headers={Accept:'application/json',...options.headers,'X-Story-Account':String(slot)};
+ if(cached)headers['If-None-Match']=cached.etag;
  if(writing)headers['X-CSRF-Token']=csrf;
  if(options.body&&!(options.body instanceof FormData)){headers['Content-Type']='application/json';options.body=JSON.stringify(options.body);}
  const {authPrompt=true,...requestOptions}=options;
- if(writing){accountWrites++;lockAccountPicker();}
+ if(writing){invalidateReads();accountWrites++;lockAccountPicker();}
  try{
-  const response=await fetch(path,{...requestOptions,headers,credentials:'same-origin'});
+  const response=await fetch(path,{...requestOptions,...(cacheable?{cache:'no-store'}:{}),headers,credentials:'same-origin'});
   if(epoch!==accountEpoch)throw scopeChanged();
+  if(cacheable&&generation!==readGeneration)throw Object.assign(new Error(''),{status:409,code:'READ_SUPERSEDED'});
+  if(response.status===304){
+   if(!cached)throw Object.assign(new Error('Сервер вернул неполный ответ. Обновите панель.'),{status:502});
+   return JSON.parse(cached.encoded);
+  }
   let data;try{data=await response.json();}catch{if(epoch!==accountEpoch)throw scopeChanged();const error=new Error(response.status===429?'Сервер попросил подождать.':'Сервер не вернул ожидаемый ответ. Повторите позже.');Object.assign(error,{status:response.status,retryAfter:retryDelay(response,30000)});throw error;}
   if(epoch!==accountEpoch)throw scopeChanged();
+  if(cacheable&&generation!==readGeneration)throw Object.assign(new Error(''),{status:409,code:'READ_SUPERSEDED'});
   if(!data||typeof data!=='object')throw new Error('Сервер не вернул ожидаемый ответ. Повторите позже.');
-  if(!response.ok){if(response.status===401&&server&&path!=='/api/auth/login'&&authPrompt){authenticated=false;showLogin();}const error=new Error(Array.isArray(data.detail)?'Проверьте значения полей.':data.detail||'Не удалось выполнить действие.');Object.assign(error,{status:response.status,code:data.code,hint:data.hint,appealUrl:data.appeal_url,freezeUntil:data.freeze_until,retryAfter:retryDelay(response,30000),diagnosticId:data.diagnostic_id,stageLabel:data.stage_label});throw error;}
+  if(!response.ok){if(response.status===401){invalidateReads();if(server&&path!=='/api/auth/login'&&authPrompt){authenticated=false;showLogin();}}const error=new Error(Array.isArray(data.detail)?'Проверьте значения полей.':data.detail||'Не удалось выполнить действие.');Object.assign(error,{status:response.status,code:data.code,hint:data.hint,appealUrl:data.appeal_url,freezeUntil:data.freeze_until,retryAfter:retryDelay(response,30000),diagnosticId:data.diagnostic_id,stageLabel:data.stage_label});throw error;}
+  if(cacheable){const etag=response.headers?.get?.('ETag');readCache.delete(cacheKey);if(etag){readCache.set(cacheKey,{etag,encoded:JSON.stringify(data)});while(readCache.size>12)readCache.delete(readCache.keys().next().value);}}
   return data;
  }finally{if(writing){accountWrites--;lockAccountPicker();}}
 }
@@ -83,8 +97,12 @@ function nav(mobile=false){return Object.entries(labels).filter(([key])=>key!=='
 function title(eyebrow,heading,sub,button=''){return `<div class='page-header'><div><div class='eyebrow'>${eyebrow}</div><h1>${heading}</h1><p class='subtitle'>${sub}</p></div>${button}</div>`;}
 function empty(type,heading,body,button=''){return `<div class='empty-state'><div class='empty-icon'>${icon(type)}</div><h3>${heading}</h3><p>${body}</p>${button}</div>`;}
 const button=(action,label,type='primary',extra='',symbol='')=>`<button type='button' class='btn ${type}' data-action='${action}' ${extra}>${symbol?icon(symbol):''}${label}</button>`;
+function queuePauseBanner(){
+ const pause=state.queue_pause;if(!pause)return '';
+ return `<section class='banner queue-pause-banner'>${icon('pause')}<div><strong>Очередь чатов на паузе</strong><p>${esc(pause.message||'Текущее задание приостановлено.')} ${pause.waiting_count?'Следующих чатов в очереди: '+number(pause.waiting_count)+'.':''}</p><small>При продолжении неподтверждённые просмотры будут пропущены.</small></div><div class='queue-pause-actions'>${button('resume-queue','Продолжить очередь','primary small',`data-id='${esc(pause.id)}'`,'play')}${button('go-jobs','Все задания','light small')}</div></section>`;
+}
 function render(){
- app.innerHTML=`<div class='app-shell'><aside class='sidebar'><a class='brand' href='#' data-tab='overview'><img src='/assets/icon.svg' alt=''><div class='brand-name'>ZAVOD <small>1.0</small></div></a><nav class='nav-list' aria-label='Основная навигация'>${nav()}</nav><div class='account-mini'><div class='avatar'>${state.account?esc(initials(state.account.name)):icon('account')}</div><div><strong>${state.account?esc(state.account.name):'Аккаунт '+accountSlot}</strong><small>${state.account?'Подключён':'Не подключён'}</small></div></div></aside><div class='workspace'><header class='topbar'><a class='mobile-brand' href='#' data-tab='overview'><img src='/assets/icon.svg' alt=''>ZAVOD <span>1.0</span></a><div class='breadcrumb'>${labels[page]}</div><div class='topbar-actions'>${accountPicker()}<button type='button' class='icon-btn' data-action='help' aria-label='Помощь'>${icon('info')}</button></div></header><main class='content'>${!server?`<div class='banner'>${icon('info')}<span><b>Предпросмотр интерфейса.</b> Сервер Telegram ещё не запущен. Импорт и задания станут доступны после запуска.</span></div>`:''}${state.storage_error?`<div class='banner error-banner'>${icon('info')}<span>${esc(state.storage_error)}</span></div>`:''}${state.cooldown_until>Date.now()/1000?`<div class='banner'>${icon('clock')}<span>Для аккаунта ${accountSlot} Telegram запросил паузу до ${esc(date(state.cooldown_until))}. Продолжим автоматически.</span></div>`:''}<div id='page-content'>${({overview:overview,sources:sourcesPage,audience:audiencePage,jobs:jobsPage,account:accountPage}[page])()}</div></main></div><nav class='mobile-nav' aria-label='Навигация с телефона'>${nav(true)}</nav></div>`;
+ app.innerHTML=`<div class='app-shell'><aside class='sidebar'><a class='brand' href='#' data-tab='overview'><img src='/assets/icon.svg' alt=''><div class='brand-name'>ZAVOD <small>1.0</small></div></a><nav class='nav-list' aria-label='Основная навигация'>${nav()}</nav><div class='account-mini'><div class='avatar'>${state.account?esc(initials(state.account.name)):icon('account')}</div><div><strong>${state.account?esc(state.account.name):'Аккаунт '+accountSlot}</strong><small>${state.account?'Подключён':'Не подключён'}</small></div></div></aside><div class='workspace'><header class='topbar'><a class='mobile-brand' href='#' data-tab='overview'><img src='/assets/icon.svg' alt=''>ZAVOD <span>1.0</span></a><div class='breadcrumb'>${labels[page]}</div><div class='topbar-actions'>${accountPicker()}<button type='button' class='icon-btn' data-action='help' aria-label='Помощь'>${icon('info')}</button></div></header><main class='content'>${!server?`<div class='banner'>${icon('info')}<span><b>Предпросмотр интерфейса.</b> Сервер Telegram ещё не запущен. Импорт и задания станут доступны после запуска.</span></div>`:''}${state.storage_error?`<div class='banner error-banner'>${icon('info')}<span>${esc(state.storage_error)}</span></div>`:''}${state.cooldown_until>Date.now()/1000?`<div class='banner'>${icon('clock')}<span>Для аккаунта ${accountSlot} Telegram запросил паузу до ${esc(date(state.cooldown_until))}. Продолжим автоматически.</span></div>`:''}${queuePauseBanner()}<div id='page-content'>${({overview:overview,sources:sourcesPage,audience:audiencePage,jobs:jobsPage,account:accountPage}[page])()}</div></main></div><nav class='mobile-nav' aria-label='Навигация с телефона'>${nav(true)}</nav></div>`;
  if(page==='audience')renderPeople();lockAccountPicker();
 }
 function overview(){
@@ -244,6 +262,7 @@ document.addEventListener('click',async e=>{
   if(action==='scan-source'){await api(`/api/sources/${id}/masslook`,{method:'POST',body:{delay:15}});toast('Парсинг и просмотр поставлены в очередь. Пачка — 5 пользователей с историями.');await go('jobs');await sync();}
   if(action==='delete-source'){showDialog(dialogTitle('Удалить чат?')+`<p>Чат будет удалён из источников. История завершённых заданий сохранится.</p><div class='dialog-actions'>${button('close-dialog','Отмена','light')}${button('delete-source-confirm','Удалить','danger',`data-id='${esc(id)}'`)}</div>`);}
   if(action==='delete-source-confirm'){await api(`/api/sources/${id}`,{method:'DELETE'});dialog.close();await sync();toast('Чат удалён.');}
+  if(action==='resume-queue'){await api(`/api/jobs/${encodeURIComponent(id)}/control`,{method:'POST',body:{action:'resume'}});await sync();toast('Очередь продолжена. Ожидание Telegram сохраняется.');}
   if(action.startsWith('job-')){await api(`/api/jobs/${id}/control`,{method:'POST',body:{action:action.slice(4)}});await sync();}
   if(['import-pause','import-resume','import-cancel'].includes(action)){await api(`/api/source-imports/${id}/control`,{method:'POST',body:{action:action.slice(7)}});await sync();}
   if(action==='more-jobs'){jobsShown+=40;render();}

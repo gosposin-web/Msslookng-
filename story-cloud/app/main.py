@@ -43,6 +43,18 @@ STATIC = Path(__file__).parent / 'static'
 COOKIE = 'story_cloud_session'
 
 
+def conditional_json(request,payload):
+    response=JSONResponse(payload)
+    etag='W/"'+hashlib.sha256(response.body).hexdigest()+'"'
+    headers={'ETag':etag,'Cache-Control':'private, no-store',
+             'Vary':'Cookie, X-Story-User, X-Story-Account, Accept-Encoding'}
+    candidates=request.headers.get('if-none-match','').split(',')
+    if any(tag.strip()=='*' or tag.strip().removeprefix('W/')==etag[2:] for tag in candidates):
+        return Response(status_code=304,headers=headers)
+    response.headers.update(headers)
+    return response
+
+
 class BodyLimitMiddleware:
     def __init__(self, app):
         self.app = app
@@ -320,7 +332,7 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
         return {'accounts':hub.public_accounts(),'active_account':db.slot,'max_accounts':MAX_ACCOUNTS}
 
     @app.get('/api/state')
-    def state(login=Depends(authenticated)):
+    def state(request: Request,login=Depends(authenticated)):
         counts=db.one("SELECT COUNT(*) people,COALESCE(SUM(EXISTS(SELECT 1 FROM json_each(p.stories) s WHERE json_extract(s.value,'$.expires')>?)),0) active FROM people p",(now(),))
         sources=db.all('''SELECT s.*,(SELECT COUNT(*) FROM source_people sp WHERE sp.source_id=s.id) AS collected,
                           j.status scan_status,j.message scan_message,j.id scan_id
@@ -338,6 +350,11 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                             duplicate_users=p.get('duplicate_users',0), import_errors=p.get('errors',[])[:20])
             jobs.append(item)
         cooldown=db.one("SELECT value FROM runtime WHERE key='telegram_wait_until'")
+        head=db.one("SELECT id,status,message FROM jobs WHERE kind='masslook' AND status IN ('queued','running','waiting','paused') ORDER BY created_at,rowid LIMIT 1")
+        queue_pause=None
+        if head and head['status']=='paused':
+            waiting=db.one("SELECT COUNT(*) n FROM jobs WHERE kind='masslook' AND status IN ('queued','waiting')")['n']
+            queue_pause={'id':head['id'],'message':head['message'],'waiting_count':waiting}
         job_counts={r['status']:r['n'] for r in db.all('SELECT status,COUNT(*) n FROM jobs GROUP BY status')}
         imports=db.all('''SELECT i.id,i.created_at,COUNT(j.id) total,
                            SUM(j.status='queued') queued,SUM(j.status='running') running,
@@ -345,17 +362,18 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                            SUM(j.status='done') done,SUM(j.status='failed') failed,SUM(j.status='cancelled') cancelled
                            FROM source_imports i JOIN source_import_jobs ij ON ij.import_id=i.id
                            JOIN jobs j ON j.id=ij.job_id GROUP BY i.id ORDER BY i.created_at DESC,i.rowid DESC LIMIT 5''')
-        return {'account':db.public_account(),'accounts':hub.public_accounts(),'active_account':db.slot,'max_accounts':MAX_ACCOUNTS,'module_version':2,
+        payload={'account':db.public_account(),'accounts':hub.public_accounts(),'active_account':db.slot,'max_accounts':MAX_ACCOUNTS,'module_version':2,
                 'proxy':hub.proxy_store.selected(db.slot),
                 'channels':db.all('SELECT id,title,username,created_at FROM channels ORDER BY created_at DESC LIMIT 100'),
                 'sources':sources,'jobs':jobs,'events':db.all('SELECT * FROM events ORDER BY id DESC LIMIT 50'),
-                'job_counts':job_counts,'job_total':sum(job_counts.values()),'source_imports':imports,
+                'job_counts':job_counts,'job_total':sum(job_counts.values()),'source_imports':imports,'queue_pause':queue_pause,
                 'stats':{'people':counts['people'],'active':counts['active'],'views_24h':db.one('SELECT COUNT(*) n FROM views WHERE viewed_at>?',(now()-86400,))['n']},
                 'view_limit_24h':VIEW_LIMIT_24H,'cooldown_until':cooldown['value'] if cooldown else 0,
                 'telegram_api_configured':bool(config.telegram_api_id and config.telegram_api_hash) or config.public_api_defaults,
                 'telegram_api_mode':'custom' if config.telegram_api_id and config.telegram_api_hash else 'public' if config.public_api_defaults else 'required',
                 'auth_mode':'chatgpt' if config.bridge_secret else 'password',
                 'free_mode':config.free_mode,'storage_error':storage.error if storage else ''}
+        return conditional_json(request,payload)
 
     @app.get('/api/proxies')
     def list_proxies(offset: int=0,limit: int=50,login=Depends(authenticated)):
@@ -699,21 +717,20 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
         return sql+' ORDER BY p.checked_at DESC,p.user_id',args
 
     @app.get('/api/people')
-    def people(search: str='',source: str='',active: bool=True,offset: int=0,login=Depends(authenticated)):
+    def people(request: Request,search: str='',source: str='',active: bool=True,offset: int=0,login=Depends(authenticated)):
         if offset<0 or offset>100000:
             raise HTTPException(400,'Недопустимое смещение.')
         sql,args=people_query(search,source,active)
         total=db.one('SELECT COUNT(*) n FROM ('+sql+')',args)['n']
         rows=db.all(sql+' LIMIT 100 OFFSET ?',[*args,offset])
         account=db.account()
+        counts=db.view_counts(account['user_id'],[row['user_id'] for row in rows]) if account else {}
         result=[]
         for row in rows:
             item=db.public_person(row)
-            confirmed=db.confirmed_viewed_ids(account['user_id'],row['user_id']) if account else set()
-            item['viewed_count']=len(confirmed)
-            item['unconfirmed_count']=len(db.viewed_ids(account['user_id'],row['user_id'])-confirmed) if account else 0
+            item['viewed_count'],item['unconfirmed_count']=counts.get(row['user_id'],(0,0))
             result.append(item)
-        return {'people':result,'total':total,'offset':offset}
+        return conditional_json(request,{'people':result,'total':total,'offset':offset})
 
     @app.get('/api/people/export')
     def export(search: str='',source: str='',active: bool=True,login=Depends(authenticated)):

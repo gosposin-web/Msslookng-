@@ -214,6 +214,13 @@ class DB:
         self.execute("UPDATE jobs SET status='queued',next_run=?,updated_at=? WHERE id=? AND status='running'", (now()+delay,now(),job_id))
 
     def recover(self):
+        # Discovery/checking has no Telegram side effect. Preserve deliberate
+        # user pauses, but resume safe read steps interrupted by a server restart.
+        self.execute("""UPDATE jobs SET status='queued',message='Поиск историй продолжен после перезапуска.',updated_at=?
+                        WHERE status='running' AND kind='masslook'
+                        AND json_extract(payload,'$.phase') IN ('gather','check')
+                        AND json_type(payload,'$.uncertain') IS NULL
+                        AND NOT EXISTS(SELECT 1 FROM reaction_tasks r WHERE r.job_id=jobs.id AND r.status='sending')""",(now(),))
         self.execute("UPDATE reaction_tasks SET status='uncertain',message='Сервер перезапущен до подтверждения реакции.' WHERE status='sending'")
         # A view RPC might have succeeded before a crash. Do not silently repeat it.
         self.execute("UPDATE jobs SET status='paused',message='Сервер перезапущен. Проверьте результат и продолжите вручную.',updated_at=? WHERE status='running' AND kind IN ('view','masslook')", (now(),))
@@ -252,6 +259,21 @@ class DB:
     def confirmed_viewed_ids(self,account_id,user_id):
         return {r['story_id'] for r in self.all('SELECT story_id FROM views WHERE account_id=? AND user_id=?',
                                                (account_id,user_id))}
+
+    def view_counts(self,account_id,user_ids):
+        if not user_ids:return {}
+        placeholders=','.join('?' for _ in user_ids)
+        rows=self.all(f'''SELECT user_id,0 AS pending,COUNT(*) AS n FROM views
+                         WHERE account_id=? AND user_id IN ({placeholders}) GROUP BY user_id
+                         UNION ALL
+                         SELECT a.user_id,1 AS pending,COUNT(*) AS n FROM view_attempts a
+                         WHERE a.account_id=? AND a.user_id IN ({placeholders})
+                         AND NOT EXISTS(SELECT 1 FROM views v WHERE v.account_id=a.account_id
+                                        AND v.user_id=a.user_id AND v.story_id=a.story_id)
+                         GROUP BY a.user_id''',[account_id,*user_ids,account_id,*user_ids])
+        result={}
+        for row in rows:result.setdefault(row['user_id'],[0,0])[row['pending']]=row['n']
+        return result
 
     def cleanup_masslook(self,job_id,user_ids=None,*,final=False):
         with self.connect() as c:

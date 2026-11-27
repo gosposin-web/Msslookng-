@@ -502,3 +502,87 @@ test('A late proxy list cannot overwrite another account connection',async()=>{
  release(json({proxies:[{id:'stale',label:'Old'}],total:1,selected:{id:'stale'}}));await rejected;
  assert.equal(vm.runInContext('state.proxy',h.context),null);assert.equal(vm.runInContext('proxyData.rows.length',h.context),0);
 });
+
+test('An unchanged panel uses its private ETag and returns an unmodified copy',async()=>{
+ const tag='W/"state-test"';let validations=0;
+ const h=await harness((p,_,o)=>{
+  if(p==='/api/state'){
+   if(o.headers['If-None-Match']===tag){validations++;return new Response(null,{status:304,headers:{ETag:tag}});}
+   return json(emptyState,200,{ETag:tag});
+  }
+  return normal(p);
+ });
+ vm.runInContext('state.stats.people=999',h.context);
+ await vm.runInContext('sync()',h.context);
+ assert.equal(validations,1);assert.equal(vm.runInContext('state.stats.people',h.context),0);
+ const req=h.requests.filter(r=>r.path==='/api/state').at(-1);
+ assert.equal(req.options.headers['If-None-Match'],tag);assert.equal(req.options.cache,'no-store');
+});
+
+test('Panel cache is cleared by writes and account switches',async()=>{
+ const h=await harness((p,_,o)=>{
+  if(p==='/api/state')return json(scopedState(Number(o.headers['X-Story-Account'])),200,{ETag:'W/"slot-'+o.headers['X-Story-Account']+'"'});
+  if(p==='/api/sources'&&o.method==='POST')return json({id:'test'});
+  return scopedNormal(p,o);
+ });
+ await vm.runInContext("api('/api/sources',{method:'POST',body:{ref:'@new_group'}});",h.context);
+ await vm.runInContext('sync()',h.context);
+ assert.equal(h.requests.filter(r=>r.path==='/api/state').at(-1).options.headers['If-None-Match'],undefined);
+ await h.clickAction('select-account',{slot:'2'});
+ assert.equal(h.requests.filter(r=>r.path==='/api/state').at(-1).options.headers['If-None-Match'],undefined);
+ await h.clickAction('select-account',{slot:'1'});
+ assert.equal(h.requests.filter(r=>r.path==='/api/state').at(-1).options.headers['If-None-Match'],undefined);
+});
+
+test('A response started before a write cannot restore obsolete panel data',async()=>{
+ let pending=false,release;
+ const h=await harness((p,_,o)=>{
+  if(p==='/api/state')return pending?new Promise(resolve=>release=resolve):json(emptyState,200,{ETag:'W/"initial"'});
+  if(p==='/api/sources')return json({id:'created'});
+  return normal(p);
+ });
+ pending=true;const old=vm.runInContext('sync()',h.context);
+ const rejected=assert.rejects(old,err=>err.code==='READ_SUPERSEDED');await h.settle();
+ await vm.runInContext("api('/api/sources',{method:'POST',body:{ref:'@new_group'}})",h.context);
+ release(json({...emptyState,stats:{people:999}},200,{ETag:'W/"stale"'}));await rejected;
+ assert.equal(vm.runInContext('state.stats.people',h.context),0);
+ assert.equal(vm.runInContext('readCache.size',h.context),0);
+});
+
+test('A cache validation never hides a server error or invents a missing response body',async()=>{
+ let failed=false;
+ const h=await harness((p,_,o)=>{
+  if(p==='/api/state')return failed?json({detail:'Server unavailable'},503):json(emptyState,200,{ETag:'W/"initial"'});
+  if(p.startsWith('/api/people?'))return new Response(null,{status:304});
+  return normal(p);
+ });
+ failed=true;await assert.rejects(vm.runInContext('sync()',h.context),err=>err.status===503);
+ await assert.rejects(vm.runInContext("api('/api/people?active=false')",h.context),err=>err.status===502);
+});
+
+test('Changing audience filters keeps the read cache bounded in memory',async()=>{
+ const h=await harness((p,_,o)=>p.startsWith('/api/people?')?json({people:[],total:0},200,{ETag:'W/"'+p.split('=')[1]+'"'}):normal(p));
+ for(let i=0;i<20;i++)await vm.runInContext("api('/api/people?search="+i+"')",h.context);
+ assert(vm.runInContext('readCache.size',h.context)<=12);
+});
+
+test('The blocked chat queue explains its pause and resumes only the selected account',async()=>{
+ let resumed=false;
+ const h=await harness((p,_,o)=>{
+  if(p==='/api/state'){
+   const s=scopedState(Number(o.headers['X-Story-Account']));
+   return json({...s,queue_pause:s.active_account===2&&!resumed?{id:'paused-head',message:'<script>never run</script>',waiting_count:199}:null});
+  }
+  if(p==='/api/jobs/paused-head/control'){resumed=true;return json({ok:true});}
+  return scopedNormal(p,o);
+ });
+ await h.clickAction('select-account',{slot:'2'});
+ const html=h.elements['#app'].innerHTML;
+ assert.match(html,/Очередь чатов на паузе/);assert.match(html,/Следующих чатов в очереди: 199/);
+ assert.match(html,/&lt;script&gt;/);assert.doesNotMatch(html,/<script>never/);
+ await h.clickAction('resume-queue',{id:'paused-head'});
+ const req=h.requests.find(r=>r.path==='/api/jobs/paused-head/control');
+ assert.equal(req.options.headers['X-Story-Account'],'2');assert.equal(req.options.headers['X-CSRF-Token'],'test-csrf');
+ assert.deepEqual(JSON.parse(req.options.body),{action:'resume'});
+ assert.doesNotMatch(h.elements['#app'].innerHTML,/Очередь чатов на паузе/);
+});
