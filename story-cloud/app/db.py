@@ -54,6 +54,9 @@ class DB:
                     job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
                     user_id TEXT NOT NULL REFERENCES people(user_id) ON DELETE CASCADE,
                     checked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(job_id,user_id));
+                CREATE TABLE IF NOT EXISTS masslook_seen (
+                    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                    user_id TEXT NOT NULL, PRIMARY KEY(job_id,user_id));
                 CREATE TABLE IF NOT EXISTS views (
                     account_id TEXT NOT NULL, user_id TEXT NOT NULL, story_id INTEGER NOT NULL,
                     viewed_at INTEGER NOT NULL, PRIMARY KEY(account_id,user_id,story_id));
@@ -95,8 +98,9 @@ class DB:
                 CREATE INDEX IF NOT EXISTS view_attempts_recent ON view_attempts(account_id,created_at);
             ''')
             additions={
-                'people':{'is_premium':'INTEGER','premium_checked_at':'INTEGER'},
-                'jobs':{'reacted':'INTEGER NOT NULL DEFAULT 0'},
+                'people':{'is_premium':'INTEGER','premium_checked_at':'INTEGER','is_transient':'INTEGER NOT NULL DEFAULT 0'},
+                'jobs':{'reacted':'INTEGER NOT NULL DEFAULT 0','viewed_users':'INTEGER NOT NULL DEFAULT 0',
+                        'unconfirmed':'INTEGER NOT NULL DEFAULT 0'},
                 'account_profile':{'about':"TEXT NOT NULL DEFAULT ''",'is_premium':'INTEGER',
                     'personal_channel_id':"TEXT NOT NULL DEFAULT ''",'personal_channel_title':"TEXT NOT NULL DEFAULT ''",
                     'personal_channel_username':"TEXT NOT NULL DEFAULT ''"},
@@ -106,6 +110,7 @@ class DB:
                 for name,definition in fields.items():
                     if name not in existing:
                         c.execute('ALTER TABLE '+table+' ADD COLUMN '+name+' '+definition)
+            c.execute('CREATE INDEX IF NOT EXISTS people_transient ON people(is_transient)')
 
     @contextmanager
     def connect(self):
@@ -177,7 +182,7 @@ class DB:
         return row
 
     def update_job(self, job_id, **fields):
-        allowed = {'payload','status','collected','checked','found','viewed','reacted','message','next_run','retries'}
+        allowed = {'payload','status','collected','checked','found','viewed','viewed_users','unconfirmed','reacted','message','next_run','retries'}
         if not set(fields) <= allowed:
             raise ValueError('Unknown job fields')
         if 'payload' in fields:
@@ -193,7 +198,10 @@ class DB:
             wait = c.execute("SELECT value FROM runtime WHERE key='telegram_wait_until'").fetchone()
             if wait and wait['value']>now():
                 return None
-            row = c.execute("SELECT id FROM jobs WHERE status IN ('queued','waiting') AND next_run<=? ORDER BY created_at,rowid LIMIT 1", (now(),)).fetchone()
+            row = c.execute("""SELECT id FROM jobs WHERE status IN ('queued','waiting') AND next_run<=?
+                               AND (kind<>'masslook' OR id=(SELECT id FROM jobs WHERE kind='masslook'
+                                   AND status IN ('queued','running','waiting','paused') ORDER BY created_at,rowid LIMIT 1))
+                               ORDER BY created_at,rowid LIMIT 1""", (now(),)).fetchone()
             if not row:
                 return None
             c.execute("UPDATE jobs SET status='running',updated_at=? WHERE id=?", (now(),row['id']))
@@ -208,15 +216,16 @@ class DB:
     def recover(self):
         self.execute("UPDATE reaction_tasks SET status='uncertain',message='Сервер перезапущен до подтверждения реакции.' WHERE status='sending'")
         # A view RPC might have succeeded before a crash. Do not silently repeat it.
-        self.execute("UPDATE jobs SET status='paused',message='Сервер перезапущен. Проверьте результат и продолжите вручную.',updated_at=? WHERE status='running' AND kind='view'", (now(),))
+        self.execute("UPDATE jobs SET status='paused',message='Сервер перезапущен. Проверьте результат и продолжите вручную.',updated_at=? WHERE status='running' AND kind IN ('view','masslook')", (now(),))
         self.execute("UPDATE jobs SET status='queued',updated_at=? WHERE status='running' AND kind IN ('scan','people_import')", (now(),))
+        self.cleanup_terminal_masslook()
 
     def public_job(self, row):
         return {k: v for k,v in row.items() if k != 'payload'}
 
     def public_person(self, row):
         stories = [s for s in json.loads(row['stories']) if s['expires'] > now()]
-        return {k:v for k,v in row.items() if k not in ('peer','stories')} | {
+        return {k:v for k,v in row.items() if k not in ('peer','stories','is_transient')} | {
             'stories_count':len(stories), 'expires_at':max((s['expires'] for s in stories),default=None)}
 
     def save_person(self, person, source_id, job_id):
@@ -229,7 +238,7 @@ class DB:
                 if limit is not None and count>=limit:
                     break
                 c.execute('''INSERT INTO people(user_id,name,username,peer,created_at) VALUES(?,?,?,?,?)
-                         ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,username=excluded.username,peer=excluded.peer''',
+                         ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,username=excluded.username,peer=excluded.peer,is_transient=0''',
                       (person['user_id'],person['name'],person.get('username'),person['peer'],now()))
                 c.execute('INSERT OR IGNORE INTO source_people VALUES(?,?)', (source_id,person['user_id']))
                 count+=c.execute('INSERT OR IGNORE INTO job_people(job_id,user_id) VALUES(?,?)', (job_id,person['user_id'])).rowcount
@@ -239,3 +248,22 @@ class DB:
         return {r['story_id'] for r in self.all('''SELECT story_id FROM views WHERE account_id=? AND user_id=?
                                                  UNION SELECT story_id FROM view_attempts WHERE account_id=? AND user_id=?''',
                                                (account_id,user_id,account_id,user_id))}
+
+    def confirmed_viewed_ids(self,account_id,user_id):
+        return {r['story_id'] for r in self.all('SELECT story_id FROM views WHERE account_id=? AND user_id=?',
+                                               (account_id,user_id))}
+
+    def cleanup_masslook(self,job_id,user_ids=None,*,final=False):
+        with self.connect() as c:
+            if user_ids is not None:
+                c.executemany('DELETE FROM job_people WHERE job_id=? AND user_id=?',[(job_id,uid) for uid in user_ids])
+            if final:
+                c.execute('DELETE FROM job_people WHERE job_id=?',(job_id,))
+                c.execute('DELETE FROM masslook_seen WHERE job_id=?',(job_id,))
+            c.execute('''DELETE FROM people WHERE is_transient=1
+                         AND NOT EXISTS(SELECT 1 FROM job_people jp WHERE jp.user_id=people.user_id)
+                         AND NOT EXISTS(SELECT 1 FROM source_people sp WHERE sp.user_id=people.user_id)''')
+
+    def cleanup_terminal_masslook(self):
+        for row in self.all("SELECT id FROM jobs WHERE kind='masslook' AND status IN ('done','cancelled')"):
+            self.cleanup_masslook(row['id'],final=True)

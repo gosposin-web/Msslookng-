@@ -58,6 +58,7 @@ class FakeGateway:
         self.calls.append((person['user_id'],ids))
         if self.fail:
             raise self.fail
+        return True
 
     async def import_tdata(self,folder,api_id,api_hash,passcode,password):
         assert (folder/'key_datas').exists()

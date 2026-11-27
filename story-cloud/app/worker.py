@@ -6,13 +6,15 @@ import sqlite3
 from telethon.errors import FloodWaitError
 
 from .db import now
-from .telegram import friendly_error, PersonLookupError, TelegramError
+from .telegram import friendly_error, PersonLookupError, TelegramError, ViewNotConfirmedError
 from .snapshot import SnapshotError
 from .account_access import account_error
 
 ACTIVE = ('queued','running','waiting','paused')
 TERMINAL = ('done','failed','cancelled')
 VIEW_LIMIT_24H = 200
+STORY_BATCH_SIZE = 5
+SCAN_PAGE_SIZE = 25
 
 
 class Worker:
@@ -78,7 +80,7 @@ class Worker:
                     await self.storage.flush()
                 self.ensure_snapshot(job)
                 async with asyncio.timeout(45):
-                    action = {'scan':self.scan,'view':self.view,'people_import':self.import_people}.get(job['kind'])
+                    action = {'scan':self.scan,'masslook':self.masslook,'view':self.view,'people_import':self.import_people}.get(job['kind'])
                     if not action:
                         raise TelegramError('Неизвестный тип задания. Обновите приложение.')
                     delay = await action(job)
@@ -93,7 +95,7 @@ class Worker:
                 self.db.update_job(job_id,status='paused',message=str(exc))
         except sqlite3.OperationalError:
             if self.db.running(job_id):
-                if job['kind']=='view':
+                if job['kind'] in ('view','masslook'):
                     self.db.update_job(job_id,status='paused',message='Не удалось сохранить результат. Проверьте его перед продолжением.')
                 else:
                     retries=job['retries']+1
@@ -202,7 +204,7 @@ class Worker:
                 else:
                     existing = c.execute('SELECT user_id FROM people WHERE user_id=?',(person['user_id'],)).fetchone()
                     c.execute('''INSERT INTO people(user_id,name,username,peer,created_at) VALUES(?,?,?,?,?)
-                                 ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,username=excluded.username,peer=excluded.peer''',
+                                 ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,username=excluded.username,peer=excluded.peer,is_transient=0''',
                               (person['user_id'],person['name'],person.get('username'),person['peer'],now()))
                     c.execute('INSERT INTO job_people(job_id,user_id) VALUES(?,?)',(job['id'],person['user_id']))
                     p['added'] += int(not existing)
@@ -231,12 +233,83 @@ class Worker:
                       (json.dumps(p),int(bool(stories)),'Проверяем пользователей из списка.',now(),job['id']))
         return 3
 
+    async def masslook(self,job):
+        p=job['payload']
+        if p.get('phase') in ('view','reactions'):
+            return await self.view(job)
+        source=self.db.one('SELECT * FROM sources WHERE id=?',(job['source_id'],))
+        if not source:
+            self.db.update_job(job['id'],status='cancelled',message='Источник удалён.')
+            self.db.cleanup_masslook(job['id'],final=True)
+            return 0
+        pending=self.db.one('''SELECT p.* FROM people p JOIN job_people jp ON jp.user_id=p.user_id
+                               WHERE jp.job_id=? AND jp.checked=0 ORDER BY jp.rowid LIMIT 1''',(job['id'],))
+        if pending:
+            stories=await self.gateway.stories(pending)
+            self.ensure_snapshot(job)
+            if not self.db.running(job['id']):return 0
+            queue=p.setdefault('user_ids',[])
+            if stories and pending['user_id'] not in queue:queue.append(pending['user_id'])
+            if len(queue)>=STORY_BATCH_SIZE:p['phase']='view';p['position']=0
+            with self.db.connect() as c:
+                c.execute('UPDATE people SET stories=?,checked_at=? WHERE user_id=?',(json.dumps(stories),now(),pending['user_id']))
+                c.execute('UPDATE job_people SET checked=1 WHERE job_id=? AND user_id=?',(job['id'],pending['user_id']))
+                c.execute('UPDATE jobs SET payload=?,checked=checked+1,found=found+?,message=?,updated_at=? WHERE id=?',
+                    (json.dumps(p),int(bool(stories)),f'Пачка из {len(queue)} пользователей: переходим к просмотру.' if p.get('phase')=='view' else f'Ищем истории: в пачке {len(queue)} из {STORY_BATCH_SIZE}.',now(),job['id']))
+            if not stories:self.db.cleanup_masslook(job['id'],[pending['user_id']])
+            return 3
+        if p.get('gather_done'):
+            if p.get('user_ids'):
+                p['phase']='view';p['position']=0
+                self.db.update_job(job['id'],payload=p,message='Чат закончился. Смотрим неполную последнюю пачку.')
+            else:
+                self.db.update_job(job['id'],status='done',message=f'Проверено {job["checked"]}; найдено с историями {job["found"]}; подтверждено просмотров {job["viewed"]}.')
+                self.db.cleanup_masslook(job['id'],final=True)
+                self.db.event('Парсинг и просмотр завершены. Временные записи удалены.',job['id'])
+            return 0
+        remaining=source['max_users']-job['collected']
+        page_budget=200 if source['mode']=='authors' else max(100,source['max_users']//SCAN_PAGE_SIZE+20)
+        if remaining<=0 or p.get('pages',0)>=page_budget:
+            p['gather_done']=True
+            self.db.update_job(job['id'],payload=p)
+            return 0
+        page=await self.gateway.gather(source['ref'],source['mode'],p.get('cursor',0),min(SCAN_PAGE_SIZE,remaining))
+        self.ensure_snapshot(job)
+        if not self.db.running(job['id']):return 0
+        added=0
+        with self.db.connect() as c:
+            for person in page.people[:SCAN_PAGE_SIZE]:
+                if added>=remaining:break
+                if not c.execute('INSERT OR IGNORE INTO masslook_seen VALUES(?,?)',(job['id'],person['user_id'])).rowcount:continue
+                c.execute('''INSERT INTO people(user_id,name,username,peer,created_at,is_transient) VALUES(?,?,?,?,?,1)
+                             ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,username=excluded.username,peer=excluded.peer''',
+                    (person['user_id'],person['name'],person.get('username'),person['peer'],now()))
+                c.execute('INSERT OR IGNORE INTO job_people(job_id,user_id) VALUES(?,?)',(job['id'],person['user_id']))
+                added+=1
+            p['cursor']=page.cursor;p['pages']=p.get('pages',0)+1;p['phase']='check'
+            p['gather_done']=bool(page.done or job['collected']+added>=source['max_users'])
+            c.execute('UPDATE sources SET title=? WHERE id=?',(page.title,source['id']))
+            c.execute('UPDATE jobs SET payload=?,collected=collected+?,message=?,updated_at=? WHERE id=?',
+                (json.dumps(p),added,'Проверяем небольшую страницу пользователей; большую базу не накапливаем.',now(),job['id']))
+        return 3
+
     async def view(self, job):
         p=job['payload']
+        if p.get('uncertain'):
+            p['position']=p.get('position',0)+1
+            p.pop('uncertain',None)
+            self.db.update_job(job['id'],payload=p,message='Неподтверждённый просмотр пропущен. Повторный запрос не отправлен.')
+            return p.get('delay',15)
         if p.get('phase')=='reactions':
             return await self.react(job)
         position=p.get('position',0)
         if position>=len(p['user_ids']):
+            if job['kind']=='masslook':
+                self.db.cleanup_masslook(job['id'],p['user_ids'])
+                p['user_ids']=[];p['position']=0;p['phase']='check'
+                p.pop('uncertain',None)
+                self.db.update_job(job['id'],payload=p,message='Пачка обработана. Продолжаем поиск историй.')
+                return 0
             self.db.update_job(job['id'],status='done',message='Просмотр выбранной аудитории завершён.')
             self.db.event('Задание просмотра завершено.',job['id'])
             return 0
@@ -275,8 +348,17 @@ class Worker:
                                   (account['user_id'],person['user_id'],story_id,now()))
                 if self.storage:
                     await self.storage.flush()
+                self.ensure_snapshot(job)
+                if not self.db.running(job['id']):
+                    p.pop('uncertain',None)
+                    with self.db.connect() as c:
+                        for story_id in ids:
+                            c.execute('DELETE FROM view_attempts WHERE account_id=? AND user_id=? AND story_id=?',(account['user_id'],person['user_id'],story_id))
+                        c.execute('UPDATE jobs SET payload=? WHERE id=?',(json.dumps(p),job['id']))
+                    return 0
                 try:
-                    await self.gateway.register_views(person,ids)
+                    accepted=await self.gateway.register_views(person,ids)
+                    if accepted is not True:raise ViewNotConfirmedError('Telegram не подтвердил просмотр. Счётчик не увеличен.')
                     self.ensure_snapshot(job)
                 except FloodWaitError:
                     p.pop('uncertain',None)
@@ -286,9 +368,15 @@ class Worker:
                             c.execute('DELETE FROM view_attempts WHERE account_id=? AND user_id=? AND story_id=?',
                                       (account['user_id'],person['user_id'],story_id))
                     raise
+                except ViewNotConfirmedError as exc:
+                    p.pop('uncertain',None)
+                    with self.db.connect() as c:
+                        for story_id in ids:c.execute('DELETE FROM view_attempts WHERE account_id=? AND user_id=? AND story_id=?',(account['user_id'],person['user_id'],story_id))
+                        c.execute("UPDATE jobs SET status=CASE WHEN status='running' THEN 'paused' ELSE status END,payload=?,unconfirmed=unconfirmed+1,message=CASE WHEN status IN ('running','paused') THEN ? ELSE message END,updated_at=? WHERE id=?",(json.dumps(p),str(exc),now(),job['id']))
+                    return 0
                 except BaseException:
                     if self.db.running(job['id']):
-                        self.db.update_job(job['id'],status='paused',message='Ответ на просмотр не получен. При продолжении эта история будет пропущена.')
+                        self.db.update_job(job['id'],status='paused',unconfirmed=job.get('unconfirmed',0)+1,message='Ответ на просмотр не получен. Счётчик не увеличен; повтор исключён до проверки.')
                     raise
                 with self.db.connect() as c:
                     for story_id in ids:
@@ -311,12 +399,12 @@ class Worker:
                         p['reaction_user']=person['user_id']
                     else:
                         p['position']=position+1
-                    c.execute('UPDATE jobs SET payload=?,checked=checked+1,viewed=viewed+?,message=?,updated_at=? WHERE id=?',
-                              (json.dumps(p),count,'Просмотры сохранены. '+('Отправляем реакцию без Premium.' if pending else 'Продолжаем просмотр.'),now(),job['id']))
+                    c.execute('UPDATE jobs SET payload=?,checked=checked+?,viewed=viewed+?,viewed_users=viewed_users+1,message=?,updated_at=? WHERE id=?',
+                              (json.dumps(p),int(job['kind']!='masslook'),count,'Просмотры подтверждены Telegram. '+('Отправляем реакцию без Premium.' if pending else 'Продолжаем просмотр.'),now(),job['id']))
                 return 3 if pending else p['delay']
         p['position']=position+1
-        self.db.update_job(job['id'],payload=p,checked=job['checked']+1,viewed=job['viewed']+count,
-                           message='Просмотр выбранных историй.')
+        self.db.update_job(job['id'],payload=p,checked=job['checked']+int(job['kind']!='masslook'),viewed=job['viewed']+count,
+                           message='Новых доступных историй нет или они уже обработаны. Новые просмотры не засчитаны.')
         return p['delay']
 
     async def react(self,job):
@@ -325,7 +413,8 @@ class Worker:
                          (job['id'],p['reaction_user']))
         if not task:
             p['position']=p.get('position',0)+1
-            p.pop('phase',None)
+            if job['kind']=='masslook':p['phase']='view'
+            else:p.pop('phase',None)
             p.pop('reaction_user',None)
             self.db.update_job(job['id'],payload=p,message='Переходим к следующему пользователю.')
             return p['delay']

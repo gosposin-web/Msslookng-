@@ -27,16 +27,16 @@ def test_legacy_account_and_audience_stay_in_slot_one(tmp_path):
     assert root.account()['user_id'] == '90001'
     assert root.one('SELECT COUNT(*) n FROM people')['n'] == 1
     assert root.one('SELECT COUNT(*) n FROM jobs')['n'] == 1
-    for slot in range(2, 6):
+    for slot in range(2, 16):
         other = AccountDB(path, slot)
         assert other.account() is None
         assert other.one('SELECT COUNT(*) n FROM people')['n'] == 0
         assert other.one('SELECT COUNT(*) n FROM jobs')['n'] == 0
 
 
-def test_five_workspaces_allow_identical_target_and_source_ids(tmp_path):
+def test_fifteen_workspaces_allow_identical_target_and_source_ids(tmp_path):
     path = tmp_path / 'state.sqlite3'
-    for slot in range(1, 6):
+    for slot in range(1, 16):
         db = AccountDB(path, slot)
         add_account(db, 90000 + slot)
         db.execute('INSERT INTO sources VALUES(?,?,?,?,?,?)',
@@ -44,7 +44,7 @@ def test_five_workspaces_allow_identical_target_and_source_ids(tmp_path):
         db.execute('INSERT INTO people(user_id,name,username,peer,created_at) VALUES(?,?,?,?,?)',
                    ('12345', 'Person ' + str(slot), 'test_person', b'synthetic-peer', now()))
         db.execute('INSERT INTO source_people VALUES(?,?)', ('same-source-id', '12345'))
-    for slot in range(1, 6):
+    for slot in range(1, 16):
         db = AccountDB(path, slot)
         assert db.account()['user_id'] == str(90000 + slot)
         assert db.one('SELECT * FROM sources')['max_users'] == slot
@@ -89,10 +89,10 @@ def test_identifiers_are_scoped_without_changing_literals_or_parameters(tmp_path
         "SELECT 'people and jobs', account_2_people.user_id FROM account_2_people")
 
 
-def test_backup_preserves_all_five_accounts(tmp_path):
+def test_backup_preserves_all_fifteen_accounts(tmp_path):
     path, backup = tmp_path / 'state.sqlite3', tmp_path / 'backup.sqlite3'
     root = AccountDB(path)
-    for slot in range(1, 6):
+    for slot in range(1, 16):
         add_account(AccountDB(path, slot), 90000 + slot)
     target = sqlite3.connect(backup)
     try:
@@ -102,7 +102,7 @@ def test_backup_preserves_all_five_accounts(tmp_path):
         target.close()
     restored = AccountDB(backup)
     assert restored.account()['user_id'] == '90001'
-    assert AccountDB(backup, 5).account()['user_id'] == '90005'
+    assert AccountDB(backup, 15).account()['user_id'] == '90015'
 
 
 def test_legacy_restore_recreates_other_namespaces(tmp_path):
@@ -122,7 +122,7 @@ def test_isolation_inventory_covers_the_existing_schema():
     assert tables - {'logins', 'login_failures'} <= SCOPED_TABLES
 
 
-@pytest.mark.parametrize('value', [0, 6, -1, True, '2', 1.5, None])
+@pytest.mark.parametrize('value', [0, 16, -1, True, '2', 1.5, None])
 def test_invalid_slots_are_rejected(value):
     with pytest.raises(ValueError):
         account_slot(value)
@@ -188,7 +188,7 @@ async def test_concurrent_contexts_remain_separate(tmp_path):
             return proxy.slot
         finally:
             hub.reset(token)
-    assert await asyncio.gather(*(request(slot) for slot in range(1, 6))) == [1, 2, 3, 4, 5]
+    assert await asyncio.gather(*(request(slot) for slot in range(1, 16))) == list(range(1,16))
     assert proxy.slot == 1
     await hub.close()
     assert all(gateway.closed for gateway in hub.gateways.values())

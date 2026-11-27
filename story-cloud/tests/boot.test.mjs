@@ -6,7 +6,7 @@ import {webcrypto} from 'node:crypto';
 
 const source=await readFile(new URL('../app/static/app.js',import.meta.url),'utf8');
 const healthy={ok:true,service:'story-cloud',ready:true};
-const emptyState={account:null,accounts:[],active_account:1,max_accounts:5,sources:[],jobs:[],events:[],stats:{people:0,active:0,views_24h:0},view_limit_24h:200};
+const emptyState={account:null,proxy:null,accounts:[],active_account:1,max_accounts:15,module_version:2,sources:[],jobs:[],events:[],stats:{people:0,active:0,views_24h:0},view_limit_24h:200};
 const json=(data,status=200,headers={})=>Response.json(data,{status,headers});
 
 // Run the actual browser script with a small DOM boundary and a controllable clock.
@@ -49,7 +49,7 @@ async function harness(responder,wakeUrl='',returned=false){
  };
 }
 
-function normal(path){if(path==='/health')return json(healthy);if(path==='/api/auth/me')return json({csrf:'test-csrf'});if(path==='/api/state')return json(emptyState);throw new Error('Unexpected request');}
+function normal(path){if(path.startsWith('/api/proxies?'))return json({proxies:[],total:0,selected:null});if(path==='/health')return json(healthy);if(path==='/api/auth/me')return json({csrf:'test-csrf'});if(path==='/api/state')return json(emptyState);throw new Error('Unexpected request');}
 function noPreview(h){assert.doesNotMatch(h.elements['#app'].innerHTML,/Предпросмотр интерфейса|Сервер Telegram ещё не запущен/);assert.equal(h.elements['#dialog'].open,false);}
 test('An older backend cannot expose multiaccount controls or modify the wrong account',async()=>{
  const h=await harness(path=>path==='/api/state'?json({...emptyState,max_accounts:undefined,accounts:undefined}):normal(path),'https://our-app.onrender.com/wake');
@@ -305,7 +305,7 @@ test('User import queue shows its progress and escaped per-user failures',async(
 const owner=(name,user_id)=>({name,user_id,first_name:name,last_name:'',username:'owner_'+user_id,profile_loaded:true,about:'',is_premium:false,created_at:1800000000});
 function scopedState(slot){
  const accounts=[{...owner('Первый','101'),slot:1},{...owner('Второй','202'),slot:2}];
- return {...emptyState,accounts,active_account:slot,max_accounts:5,account:accounts.find(a=>a.slot===slot)||null,channels:[]};
+ return {...emptyState,accounts,active_account:slot,max_accounts:15,module_version:2,account:accounts.find(a=>a.slot===slot)||null,channels:[]};
 }
 function scopedNormal(path,options){
  if(path==='/api/state')return json(scopedState(Number(options.headers['X-Story-Account'])));
@@ -314,18 +314,18 @@ function scopedNormal(path,options){
  return normal(path);
 }
 
-test('ZAVOD renders four navigation tabs and five account slots',async()=>{
+test('ZAVOD renders four navigation tabs and fifteen account slots',async()=>{
  const h=await harness((p,_,o)=>scopedNormal(p,o));
  const html=h.elements['#app'].innerHTML;
  assert.match(html,/ZAVOD/);assert.doesNotMatch(html,/лупа|stories workspace|hero-card|Первые шаги/);
  assert.match(html,/id='account-picker'/);
- assert.equal((html.match(/<option value='[1-5]'/g)||[]).length,5);
+ assert.equal((html.match(/<option value='(?:[1-9]|1[0-5])'/g)||[]).length,15);
  const mobile=html.slice(html.indexOf("class='mobile-nav'"));
  assert.equal((mobile.match(/data-tab=/g)||[]).length,4);
  assert.match(html,/Premium/);
  await h.clickAction('go-account');
  const profile=h.elements['#app'].innerHTML;
- assert.match(profile,/2 из 5 подключено/);
+ assert.match(profile,/2 из 15 подключено/);
  assert.match(profile,/id='profile-about-form'/);
  assert.match(profile,/id='profile-channel-form'/);
  assert.match(profile,/id='channel-create-form'/);
@@ -385,14 +385,14 @@ test('An account mutation holds the selection until its result is received',asyn
  assert.equal(vm.runInContext('accountSlot',h.context),2);
 });
 
-test('Five occupied slots prevent opening a sixth account',async()=>{
+test('Fifteen occupied slots prevent opening a sixteenth account',async()=>{
  const h=await harness(normal);
- vm.runInContext("state.accounts=Array.from({length:5},(_,i)=>({slot:i+1,name:'Аккаунт '+(i+1)}));page='account';render()",h.context);
- assert.match(h.elements['#app'].innerHTML,/5 из 5 подключено/);
+ vm.runInContext("state.accounts=Array.from({length:15},(_,i)=>({slot:i+1,name:'Аккаунт '+(i+1)}));page='account';render()",h.context);
+ assert.match(h.elements['#app'].innerHTML,/15 из 15 подключено/);
  assert.match(h.elements['#app'].innerHTML,/data-action='add-account' disabled/);
  const before=h.requests.length;await h.clickAction('add-account');
  assert.equal(h.requests.length,before);
- assert.match(h.elements['#toast'].textContent,/до пяти аккаунтов/);
+ assert.match(h.elements['#toast'].textContent,/до 15 аккаунтов/);
 });
 
 test('Bio and personal channel forms save to the selected account and show canonical values',async()=>{
@@ -445,5 +445,60 @@ test('View confirmation describes Premium policy and jobs show acknowledged reac
  const h=await harness(normal);vm.runInContext("selected.add('123');viewDialog()",h.context);
  assert.match(h.elements['#dialog'].innerHTML,/Premium/);assert.match(h.elements['#dialog'].innerHTML,/👍/);
  const html=vm.runInContext("jobCard({id:'v',kind:'view',status:'done',viewed:3,reacted:2,checked:3,total:3})",h.context);
- assert.match(html,/Просмотров: 3 · Реакций: 2/);
+ assert.match(html,/Подтверждено просмотров: 3/);assert.match(html,/Реакций: 2/);
+});
+
+test('Batch mode uses an explicit view endpoint and file import can keep collection only',async()=>{
+ const h=await harness((p,_,o)=>p==='/api/sources/chat-one/masslook'?json({id:'batch-job'}):scopedNormal(p,o));
+ await h.clickAction('scan-source',{id:'chat-one'});
+ const req=h.requests.find(r=>r.path==='/api/sources/chat-one/masslook');
+ assert.equal(req.options.method,'POST');assert.deepEqual(JSON.parse(req.options.body),{delay:15});
+ assert.equal(h.requests.some(r=>r.path.endsWith('/scan')),false);
+ await h.clickAction('import-chats');const html=h.elements['#dialog'].innerHTML;
+ assert.match(html,/name='auto_view' checked/);assert.match(html,/пачками по 5/);
+ assert.match(html,/только сбор и проверка историй без просмотра/);
+});
+
+test('Legacy scan labels and uncertain statistics never imply successful views',async()=>{
+ const h=await harness(normal);
+ const old=vm.runInContext("jobCard({id:'old',kind:'scan',status:'done',found:55,checked:4600,total:4600})",h.context);
+ assert.match(old,/Только сбор и проверка/);assert.match(old,/Просмотр в нём не запускался/);
+ const batch=vm.runInContext("jobCard({id:'batch',kind:'masslook',status:'paused',found:55,viewed:0,viewed_users:0,unconfirmed:2,batch_pending:5})",h.context);
+ assert.match(batch,/Подтверждено просмотров: 0/);assert.match(batch,/Попыток без подтверждения: 2/);assert.match(batch,/В пачке: 5 \/ 5/);
+});
+
+test('The previous five-account module stays behind the backend update guard',async()=>{
+ const h=await harness(p=>p==='/api/state'?json({...emptyState,max_accounts:5,module_version:undefined}):normal(p));
+ assert.match(h.elements['#app'].innerHTML,/Ожидаем обновления сервера/);assert.equal(h.intervals.size,0);
+});
+
+test('Proxy controls work before tdata import and keep sharing an explicit choice',async()=>{
+ const h=await harness(normal);await h.clickAction('go-account');
+ const html=h.elements['#app'].innerHTML;
+ assert.match(html,/proxy-assignment-form/);assert.match(html,/1 прокси = 1 аккаунт/);
+ await h.clickAction('add-proxy');const form=h.elements['#dialog'].innerHTML;
+ assert.match(form,/SOCKS5/);assert.match(form,/HTTP CONNECT/);assert.match(form,/type='password'/);
+ assert.doesNotMatch(form,/name='allow_shared' checked/);
+ assert.match(form,/Добавление в список не назначает прокси аккаунтам/);
+});
+
+test('Proxy editing sends new credentials only and account assignment is scoped',async()=>{
+ const h=await harness((p,_,o)=>p==='/api/proxies/proxy-one'?json({proxy:{id:'proxy-one'}}):p==='/api/account/proxy'?json({proxy:null}):scopedNormal(p,o));
+ await h.clickAction('select-account',{slot:'15'});
+ await h.submitForm('proxy-form',{label:'Test',host:'8.8.8.8',port:'1080',protocol:'socks5',username:'',password:''},{proxy:'proxy-one'});
+ const patch=h.requests.find(r=>r.path==='/api/proxies/proxy-one'),body=JSON.parse(patch.options.body);
+ assert.equal(patch.options.method,'PATCH');assert.equal(body.allow_shared,false);
+ assert.equal(Object.hasOwn(body,'password'),false);assert.equal(Object.hasOwn(body,'username'),false);
+ await h.submitForm('proxy-assignment-form',{proxy_id:'proxy-one'});
+ const assign=h.requests.find(r=>r.path==='/api/account/proxy');
+ assert.equal(assign.options.headers['X-Story-Account'],'15');assert.deepEqual(JSON.parse(assign.options.body),{proxy_id:'proxy-one'});
+});
+
+test('A late proxy list cannot overwrite another account connection',async()=>{
+ let delayed=false,release;
+ const h=await harness((p,_,o)=>delayed&&p.startsWith('/api/proxies?')&&o.headers['X-Story-Account']==='1'?new Promise(resolve=>release=resolve):scopedNormal(p,o));
+ delayed=true;const old=vm.runInContext('loadProxies()',h.context);const rejected=assert.rejects(old,err=>err.code==='ACCOUNT_CHANGED');
+ await h.settle();await h.clickAction('select-account',{slot:'2'});
+ release(json({proxies:[{id:'stale',label:'Old'}],total:1,selected:{id:'stale'}}));await rejected;
+ assert.equal(vm.runInContext('state.proxy',h.context),null);assert.equal(vm.runInContext('proxyData.rows.length',h.context),0);
 });

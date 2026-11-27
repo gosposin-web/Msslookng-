@@ -1,4 +1,4 @@
-"""Five account-local workspaces inside the existing encrypted checkpoint."""
+"""Account-local workspaces inside the existing encrypted checkpoint."""
 import asyncio
 import re
 import sqlite3
@@ -7,16 +7,16 @@ from pathlib import Path
 
 from .db import DB
 
-MAX_ACCOUNTS = 5
+MAX_ACCOUNTS = 15
 SCOPED_TABLES = frozenset({
     'account', 'account_profile', 'sources', 'people', 'source_people',
     'jobs', 'job_people', 'views', 'view_attempts', 'events', 'runtime',
     'source_imports', 'source_import_jobs', 'people_imports',
-    'reaction_tasks', 'channel_requests', 'channels',
+    'reaction_tasks', 'channel_requests', 'channels', 'masslook_seen',
 })
 SCOPED_INDEXES = frozenset({
     'jobs_queue', 'jobs_source_created', 'job_people_unchecked',
-    'views_recent', 'view_attempts_recent', 'reaction_tasks_pending',
+    'views_recent', 'view_attempts_recent', 'reaction_tasks_pending', 'people_transient',
 })
 _NAMES = SCOPED_TABLES | SCOPED_INDEXES
 _IDENTIFIER = re.compile(r'\b(?:' + '|'.join(sorted(_NAMES, key=len, reverse=True)) + r')\b', re.I)
@@ -25,7 +25,7 @@ _QUOTED = re.compile(r"""('(?:''|[^'])*'|"[^"]*"|`[^`]*`|\[[^\]]*\])""")
 
 def account_slot(value):
     if type(value) is not int or not 1 <= value <= MAX_ACCOUNTS:
-        raise ValueError('Аккаунт: выберите номер от 1 до 5.')
+        raise ValueError(f'Аккаунт: выберите номер от 1 до {MAX_ACCOUNTS}.')
     return value
 
 
@@ -92,6 +92,8 @@ class AccountDB(DB):
     def initialize_schema(self):
         super().initialize_schema()
         if self.slot == 1:
+            from .proxies import create_proxy_schema
+            create_proxy_schema(self)
             # Also runs after restoring an older single-account checkpoint.
             for slot in range(2, MAX_ACCOUNTS + 1):
                 AccountDB(self.path, slot)
@@ -125,6 +127,10 @@ class AccountHub:
             for db in self.databases.values():
                 db.on_change = self.storage.changed
         self.gateways = {slot: gateway_factory(db, cipher) for slot, db in self.databases.items()}
+        from .proxies import ProxyStore
+        self.proxy_store=ProxyStore(root,cipher)
+        for slot,gateway in self.gateways.items():
+            gateway.proxy_provider=lambda slot=slot:self.proxy_store.connection(slot)
         self.workers = {
             slot: worker_factory(db, self.gateways[slot], self.storage)
             for slot, db in self.databases.items()

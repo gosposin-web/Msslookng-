@@ -106,6 +106,7 @@ async def test_snapshot_loss_after_view_keeps_uncertain_intent_and_never_repeats
     async def register(person,ids):
         gateway.calls.append((person['user_id'],ids))
         storage.restore_generation+=1
+        return True
     gateway.register_views=register
     jid=db.create_job('view',{'user_ids':['11111'],'position':0,'delay':5})
     await tick(db,worker)

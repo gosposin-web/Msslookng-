@@ -20,6 +20,11 @@ class TelegramError(ValueError):
     pass
 
 
+class ViewNotConfirmedError(TelegramError):
+    """Telegram explicitly returned a negative acknowledgement."""
+    pass
+
+
 class PersonLookupError(TelegramError):
     """A problem with one target, not the connected account or transport."""
     pass
@@ -41,13 +46,13 @@ def api_credentials(config,api_id=0,api_hash=''):
     return api_id,api_hash
 
 
-def create_cloud_client(session, api_id, api_hash, *, receive_updates):
+def create_cloud_client(session, api_id, api_hash, *, receive_updates,proxy=None):
     # opentele patches Telethon's constructor globally and adds an `api` argument
     # before api_id. Positional credentials silently turn api_hash into an int.
     return TelegramClient(session,api_id=api_id,api_hash=api_hash,
         device_model='ZAVOD 1.0',system_version='Cloud Linux',app_version='1.0',
         receive_updates=receive_updates,flood_sleep_threshold=0,request_retries=0,
-        connection_retries=1,retry_delay=1,timeout=10)
+        connection_retries=1,retry_delay=1,timeout=10,**({'proxy':proxy} if proxy else {}))
 
 
 async def authorize_cloud(desktop_client, cloud_client, password):
@@ -137,32 +142,54 @@ class TelegramGateway:
         self.cipher = cipher
         self.lock = asyncio.Lock()
         self.client = None
+        self.client_proxy = None
         self.entity_cache = {}
 
     async def close(self):
         client,self.client=self.client,None
+        self.client_proxy=None
         self.entity_cache.clear()
         if client:
             with suppress(Exception):
                 await asyncio.wait_for(client.disconnect(),timeout=5)
 
     async def client_for_account(self):
-        if self.client and self.client.is_connected():
+        settings=getattr(self,'proxy_provider',lambda:None)()
+        signature=settings['signature'] if settings else None
+        if self.client and self.client.is_connected() and self.client_proxy==signature:
             return self.client
         account = self.db.account()
         if not account:
             raise TelegramError('Сначала подключите аккаунт.')
+        if self.client:await self.close()
+        proxy=await self.proxy_parameters(settings)
         d = json.loads(self.cipher.decrypt(account['credential']))
         self.client = create_cloud_client(
             StringSession(d['session']), d['api_id'], d['api_hash'],
-            receive_updates=False)
+            receive_updates=False,proxy=proxy)
         try:
-            await self.client.connect()
+            await self.connect_transport(self.client,bool(proxy))
             await inspect_account(self.client)
         except BaseException:
             await self.close()
             raise
+        self.client_proxy=signature
         return self.client
+
+    async def proxy_parameters(self,settings):
+        from .proxies import resolve_connection,ProxyStoreError
+        try:return await resolve_connection(settings)
+        except ProxyStoreError:
+            raise AccountAccessError('PROXY_ADDRESS_INVALID','Не удалось подключить выбранный прокси.',
+                'Проверьте его публичный адрес и порт. Прямое подключение автоматически не включается.') from None
+
+    async def connect_transport(self,client,using_proxy):
+        try:await client.connect()
+        except Exception as exc:
+            if using_proxy and (isinstance(exc,(OSError,ConnectionError,TimeoutError)) or type(exc).__module__.startswith('python_socks')):
+                raise AccountAccessError('PROXY_CONNECT_FAILED','Не удалось установить соединение через выбранный прокси.',
+                    'Проверьте адрес, порт, логин и пароль прокси. Выберите другой прокси в настройках аккаунта, если этот недоступен.') from None
+            raise
 
     async def import_tdata(self, folder: Path, api_id: int, api_hash: str,
                            passcode: str = '', password: str = ''):
@@ -178,14 +205,16 @@ class TelegramGateway:
         desktop_client = None
         persisted = False
         try:
+            self.import_stage='proxy_connect'
+            proxy=await self.proxy_parameters(getattr(self,'proxy_provider',lambda:None)())
             # Use the Desktop authorization only to accept a fresh, separate cloud login.
             # Manage both clients explicitly: opentele's QR helper leaks clients on errors.
             self.import_stage = 'desktop_session'
             desktop_client = await desktop.ToTelethon(flag=UseCurrentSession,
                 receive_updates=False, flood_sleep_threshold=0, request_retries=0,
-                connection_retries=1, timeout=10)
+                connection_retries=1, timeout=10,**({'proxy':proxy} if proxy else {}))
             self.import_stage = 'desktop_connect'
-            await desktop_client.connect()
+            await self.connect_transport(desktop_client,bool(proxy))
             self.import_stage = 'desktop_check'
             original = await inspect_account(desktop_client)
             existing=getattr(self,'account_lookup',lambda uid:None)(original.id)
@@ -193,9 +222,9 @@ class TelegramGateway:
                 raise AccountAccessError('ACCOUNT_ALREADY_CONNECTED','Этот Telegram-аккаунт уже подключён.',
                                          'Выберите его в списке аккаунтов.')
             self.import_stage = 'cloud_session'
-            client = create_cloud_client(StringSession(),api_id,api_hash,receive_updates=True)
+            client = create_cloud_client(StringSession(),api_id,api_hash,receive_updates=True,proxy=proxy)
             self.import_stage = 'cloud_connect'
-            await client.connect()
+            await self.connect_transport(client,bool(proxy))
             self.import_stage = 'cloud_login'
             await authorize_cloud(desktop_client,client,password)
             self.import_stage = 'cloud_check'
@@ -459,14 +488,15 @@ class TelegramGateway:
         size = min(100, remaining)
         if mode == 'authors':
             # Only authors returned in readable messages; hidden membership isn't queried.
-            messages = await client.get_messages(entity,limit=50,offset_id=cursor)
+            page_limit=min(50,max(1,remaining))
+            messages = await client.get_messages(entity,limit=page_limit,offset_id=cursor)
             people = []
             for message in messages:
                 user = await message.get_sender()
                 if person := self.person(user):
                     people.append(person)
             return Page(people, messages[-1].id if messages else cursor,
-                        len(messages)<50, entity.title)
+                        len(messages)<page_limit, entity.title)
         if isinstance(entity,types.Chat):
             users = await client.get_participants(entity)
             page = users[cursor:cursor+size]
@@ -505,7 +535,8 @@ class TelegramGateway:
         # This RPC registers a view. Local persistence prevents deliberate repeat views.
         accepted = await client(functions.stories.IncrementStoryViewsRequest(peer=self.peer(person),id=story_ids))
         if not accepted:
-            raise TelegramError('Telegram не подтвердил регистрацию просмотров.')
+            raise ViewNotConfirmedError('Telegram не подтвердил регистрацию просмотров. Они не включены в счётчик.')
+        return True
 
 
 def display_name(user):

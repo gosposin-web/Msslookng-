@@ -73,6 +73,12 @@ async def test_desktop_archive_roundtrip_including_account_maps(tmp_path,passcod
     config=Config(tmp_path,'synthetic-password','a-synthetic-test-encryption-secret-over-32')
     db=DB(tmp_path/'state.sqlite3')
     gateway=TelegramGateway(db,config.cipher())
+    # Verify the same selected proxy reaches both import clients and subsequent
+    # normal sessions, without resolving or connecting to a real proxy.
+    selected_proxy={'proxy_type':'socks5','addr':'8.8.8.8','port':1080,'rdns':True}
+    gateway.proxy_provider=lambda:{'signature':'synthetic-proxy',**selected_proxy}
+    async def proxy_parameters(settings):return selected_proxy
+    monkeypatch.setattr(gateway,'proxy_parameters',proxy_parameters)
     await gateway.import_tdata(extracted,123456,'a'*32,passcode,'')
     assert len(connections)==2
     saved=json.loads(config.cipher().decrypt(db.account()['credential']))
@@ -83,6 +89,7 @@ async def test_desktop_archive_roundtrip_including_account_maps(tmp_path,passcod
     assert bytes(functions.auth.ExportLoginTokenRequest(restored.api_id,restored.api_hash,[]))
     await gateway.close()
     assert len(connections)==3 and logouts==[]
+    assert all(connection._proxy==selected_proxy for connection in connections)
 
 
 @pytest.mark.parametrize('receive_updates',[False,True])

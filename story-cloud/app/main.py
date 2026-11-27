@@ -10,7 +10,7 @@ import re
 import secrets
 import tempfile
 import uuid
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack,asynccontextmanager, suppress
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -19,6 +19,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 
 from .archive import ArchiveError, MAX_UPLOAD, extract_tdata
 from .config import Config
@@ -35,6 +37,7 @@ from .chat_files import MAX_CHAT_FILE, ChatFileError, parse_chat_file
 from .source_store import SourceStoreError, add_source as store_source, import_sources, control_import, start_scan
 from .people_imports import (MAX_PEOPLE_FILE, PeopleImportError, PeopleList,
                              normalize_person, parse_people_file, queue_people)
+from .proxies import ProxyStoreError
 
 STATIC = Path(__file__).parent / 'static'
 COOKIE = 'story_cloud_session'
@@ -97,6 +100,10 @@ class ViewInput(BaseModel):
     delay: int = Field(default=15,ge=5,le=300)
 
 
+class MasslookInput(BaseModel):
+    delay: int = Field(default=15,ge=5,le=300)
+
+
 class PersonInput(BaseModel):
     username: str = Field(min_length=1, max_length=200)
     request_id: str = Field(default='', max_length=80)
@@ -104,6 +111,10 @@ class PersonInput(BaseModel):
 
 class ControlInput(BaseModel):
     action: str
+
+
+class ProxyAssignmentInput(BaseModel):
+    proxy_id: str | None = Field(default=None,max_length=80)
 
 
 class NameInput(BaseModel):
@@ -184,6 +195,12 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
     app.add_middleware(BodyLimitMiddleware)
     app.add_middleware(GZipMiddleware,minimum_size=1024,compresslevel=6)
 
+    @app.exception_handler(RequestValidationError)
+    async def proxy_validation_error(request,exc):
+        if request.url.path.startswith('/api/proxies') or request.url.path=='/api/account/proxy':
+            return JSONResponse({'detail':'Проверьте поля настройки прокси.'},status_code=400)
+        return await request_validation_exception_handler(request,exc)
+
     @app.middleware('http')
     async def headers(request,call_next):
         if storage and not storage.ready and request.url.path.startswith('/api/') and request.url.path!='/api/auth/me':
@@ -218,8 +235,8 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
         if raw is None and request.method in ('GET','HEAD') and request.url.path=='/api/account/profile/photo':
             raw=request.query_params.get('account')
         raw=raw or '1'
-        if not re.fullmatch(r'[1-5]',raw):
-            return JSONResponse({'detail':'Выберите аккаунт от 1 до 5.'},status_code=400)
+        if not re.fullmatch(r'[1-9][0-9]?',raw) or int(raw)>MAX_ACCOUNTS:
+            return JSONResponse({'detail':f'Выберите аккаунт от 1 до {MAX_ACCOUNTS}.'},status_code=400)
         token=hub.bind(int(raw))
         try:
             return await call_next(request)
@@ -307,13 +324,14 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
         counts=db.one("SELECT COUNT(*) people,COALESCE(SUM(EXISTS(SELECT 1 FROM json_each(p.stories) s WHERE json_extract(s.value,'$.expires')>?)),0) active FROM people p",(now(),))
         sources=db.all('''SELECT s.*,(SELECT COUNT(*) FROM source_people sp WHERE sp.source_id=s.id) AS collected,
                           j.status scan_status,j.message scan_message,j.id scan_id
-                          FROM sources s LEFT JOIN jobs j ON j.id=(SELECT id FROM jobs WHERE source_id=s.id AND kind='scan' ORDER BY created_at DESC,rowid DESC LIMIT 1)
+                          FROM sources s LEFT JOIN jobs j ON j.id=(SELECT id FROM jobs WHERE source_id=s.id AND kind IN ('scan','masslook') ORDER BY created_at DESC,rowid DESC LIMIT 1)
                           ORDER BY s.created_at DESC,s.rowid DESC''')
         jobs=[]
         for row in db.all("SELECT * FROM jobs ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'waiting' THEN 1 WHEN 'queued' THEN 2 WHEN 'paused' THEN 3 ELSE 4 END,created_at DESC,rowid DESC LIMIT 600"):
             p=json.loads(row['payload'])
             item = db.public_job(row)|{'total':len(p.get('user_ids',[])) if row['kind']=='view' else row['collected'],
                                        'phase':p.get('phase','gather')}
+            if row['kind']=='masslook':item.update(batch_size=5,batch_pending=max(0,len(p.get('user_ids',[]))-p.get('position',0)))
             if row['kind']=='people_import':
                 item.update(total=len(p.get('refs',[])), processed=p.get('position',0),
                             added=p.get('added',0), rejected=p.get('rejected',0),
@@ -327,7 +345,8 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                            SUM(j.status='done') done,SUM(j.status='failed') failed,SUM(j.status='cancelled') cancelled
                            FROM source_imports i JOIN source_import_jobs ij ON ij.import_id=i.id
                            JOIN jobs j ON j.id=ij.job_id GROUP BY i.id ORDER BY i.created_at DESC,i.rowid DESC LIMIT 5''')
-        return {'account':db.public_account(),'accounts':hub.public_accounts(),'active_account':db.slot,'max_accounts':MAX_ACCOUNTS,
+        return {'account':db.public_account(),'accounts':hub.public_accounts(),'active_account':db.slot,'max_accounts':MAX_ACCOUNTS,'module_version':2,
+                'proxy':hub.proxy_store.selected(db.slot),
                 'channels':db.all('SELECT id,title,username,created_at FROM channels ORDER BY created_at DESC LIMIT 100'),
                 'sources':sources,'jobs':jobs,'events':db.all('SELECT * FROM events ORDER BY id DESC LIMIT 50'),
                 'job_counts':job_counts,'job_total':sum(job_counts.values()),'source_imports':imports,
@@ -337,6 +356,44 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                 'telegram_api_mode':'custom' if config.telegram_api_id and config.telegram_api_hash else 'public' if config.public_api_defaults else 'required',
                 'auth_mode':'chatgpt' if config.bridge_secret else 'password',
                 'free_mode':config.free_mode,'storage_error':storage.error if storage else ''}
+
+    @app.get('/api/proxies')
+    def list_proxies(offset: int=0,limit: int=50,login=Depends(authenticated)):
+        try:return hub.proxy_store.list(offset,limit)|{'selected':hub.proxy_store.selected(db.slot),'active_account':db.slot}
+        except ProxyStoreError as exc:raise HTTPException(exc.status,str(exc)) from None
+
+    @app.post('/api/proxies')
+    def add_proxy(body: dict,login=Depends(authenticated)):
+        try:return {'proxy':hub.proxy_store.save(body)}
+        except ProxyStoreError as exc:raise HTTPException(exc.status,str(exc)) from None
+
+    @app.patch('/api/proxies/{proxy_id}')
+    async def edit_proxy(proxy_id: str,body: dict,login=Depends(authenticated)):
+        slots=hub.proxy_store.assigned_slots(proxy_id)
+        if any(hub.gateways[slot].lock.locked() for slot in slots):
+            raise HTTPException(409,'Аккаунт с этим прокси занят. Приостановите его задание и повторите сохранение.')
+        try:
+            async with AsyncExitStack() as stack:
+                for slot in slots:await stack.enter_async_context(hub.gateways[slot].lock)
+                proxy=hub.proxy_store.save(body,proxy_id)
+                for slot in slots:await hub.gateways[slot].close()
+            return {'proxy':proxy}
+        except ProxyStoreError as exc:raise HTTPException(exc.status,str(exc)) from None
+
+    @app.delete('/api/proxies/{proxy_id}')
+    def delete_proxy(proxy_id: str,login=Depends(authenticated)):
+        try:hub.proxy_store.delete(proxy_id);return {'ok':True}
+        except ProxyStoreError as exc:raise HTTPException(exc.status,str(exc)) from None
+
+    @app.post('/api/account/proxy')
+    async def assign_proxy(body: ProxyAssignmentInput,login=Depends(authenticated)):
+        if gateway.lock.locked():raise HTTPException(409,'Аккаунт занят. Приостановите задание и повторите назначение прокси.')
+        try:
+            async with gateway.lock:
+                result=hub.proxy_store.assign(db.slot,body.proxy_id)
+                await gateway.close()
+            return {'proxy':result,'active_account':db.slot}
+        except ProxyStoreError as exc:raise HTTPException(exc.status,str(exc)) from None
 
     @app.post('/api/account/tdata')
     async def import_tdata(request: Request,file: UploadFile=File(...),api_id: int=Form(0),
@@ -517,6 +574,7 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                 except Exception:
                     pass
             await gateway.close()
+            hub.proxy_store.assign(db.slot,None)
             with db.connect() as c:
                 c.execute('DELETE FROM account')
                 c.execute('DELETE FROM people')
@@ -547,15 +605,17 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
     @app.post('/api/sources/import')
     async def import_chats(file: UploadFile=File(...),mode: str=Form('members'),
                            max_users: int=Form(300),start_scans: bool=Form(True),request_id: str=Form(''),
+                           auto_view: bool=Form(False),delay: int=Form(15),
                            login=Depends(authenticated)):
         try:
             if mode not in ('members','authors') or not 1<=max_users<=5000:
                 raise HTTPException(400,'Выберите режим сбора и лимит от 1 до 5000 человек на каждый чат.')
+            if not 5<=delay<=300:raise HTTPException(400,'Интервал просмотра — от 5 до 300 секунд.')
             data=await file.read(MAX_CHAT_FILE+1)
             parsed=await asyncio.to_thread(parse_chat_file,data,file.filename or '')
             if storage:
                 await storage.flush()
-            return import_sources(db,parsed,data,mode,max_users,start_scans,request_id or uuid.uuid4().hex)
+            return import_sources(db,parsed,data,mode,max_users,start_scans,request_id or uuid.uuid4().hex,auto_view=auto_view,delay=delay)
         except ChatFileError as exc:
             raise HTTPException(400,str(exc)) from None
         except SourceStoreError as exc:
@@ -568,7 +628,9 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
     @app.post('/api/source-imports/{import_id}/control')
     def control_chat_import(import_id: str,body: ControlInput,login=Depends(authenticated)):
         try:
-            return {'ok':True,'changed':control_import(db,import_id,body.action)}
+            changed=control_import(db,import_id,body.action)
+            if body.action=='cancel':db.cleanup_terminal_masslook()
+            return {'ok':True,'changed':changed}
         except SourceStoreError as exc:
             raise HTTPException(exc.status,str(exc)) from None
 
@@ -583,6 +645,13 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
     def scan(source_id: str,login=Depends(authenticated)):
         try:
             return {'id':start_scan(db,source_id)}
+        except SourceStoreError as exc:
+            raise HTTPException(exc.status,str(exc)) from None
+
+    @app.post('/api/sources/{source_id}/masslook')
+    def masslook(source_id: str,body: MasslookInput,login=Depends(authenticated)):
+        try:
+            return {'id':start_scan(db,source_id,auto_view=True,delay=body.delay)}
         except SourceStoreError as exc:
             raise HTTPException(exc.status,str(exc)) from None
 
@@ -640,7 +709,9 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
         result=[]
         for row in rows:
             item=db.public_person(row)
-            item['viewed_count']=len(db.viewed_ids(account['user_id'],row['user_id'])) if account else 0
+            confirmed=db.confirmed_viewed_ids(account['user_id'],row['user_id']) if account else set()
+            item['viewed_count']=len(confirmed)
+            item['unconfirmed_count']=len(db.viewed_ids(account['user_id'],row['user_id'])-confirmed) if account else 0
             result.append(item)
         return {'people':result,'total':total,'offset':offset}
 
@@ -675,6 +746,7 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                 person=c.execute('SELECT * FROM people WHERE user_id=?',(uid,)).fetchone()
                 if person and db.public_person(dict(person))['stories_count']:
                     selected.append(uid)
+                    c.execute('UPDATE people SET is_transient=0 WHERE user_id=?',(uid,))
             if not selected:
                 raise HTTPException(400,'У выбранных пользователей сейчас нет проверенных активных историй.')
             job_id=uuid.uuid4().hex
@@ -698,7 +770,7 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
             elif action=='resume' and job['status'] in ('paused','failed'):
                 if not c.execute('SELECT id FROM account WHERE id=1').fetchone():
                     raise HTTPException(409,'Сначала подключите аккаунт.')
-                if job['kind']=='scan' and c.execute("SELECT id FROM jobs WHERE source_id=? AND id<>? AND kind='scan' AND status IN ('queued','running','waiting','paused')",(job['source_id'],job_id)).fetchone():
+                if job['kind'] in ('scan','masslook') and c.execute("SELECT id FROM jobs WHERE source_id=? AND id<>? AND kind IN ('scan','masslook') AND status IN ('queued','running','waiting','paused')",(job['source_id'],job_id)).fetchone():
                     raise HTTPException(409,'Для этого чата уже есть другой незавершённый сбор.')
                 c.execute("UPDATE reaction_tasks SET status='uncertain',message='Неподтверждённая реакция пропущена.' WHERE job_id=? AND status='sending'",(job_id,))
                 payload=json.loads(job['payload'])
@@ -711,6 +783,7 @@ def create_app(config=None, gateway_factory=TelegramGateway, run_worker=True):
                           ('waiting' if job['next_run']>now() else 'queued',json.dumps(payload),'Задание продолжено.',now(),job_id))
             else:
                 raise HTTPException(409,'Состояние задания уже изменилось. Обновите страницу.')
+        if action=='cancel' and job['kind']=='masslook':db.cleanup_masslook(job_id,final=True)
         return {'ok':True}
 
     app.mount('/assets',StaticFiles(directory=STATIC),name='assets')

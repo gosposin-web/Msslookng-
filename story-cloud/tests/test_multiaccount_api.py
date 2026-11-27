@@ -20,7 +20,7 @@ def test_account_header_scopes_state_sources_and_jobs(setup):
     second = client.post('/api/sources', json={'ref':'@group_two'}).json()['id']
     state = client.get('/api/state').json()
     assert state['account']['user_id'] == '90002'
-    assert state['active_account'] == 2 and state['max_accounts'] == 5
+    assert state['active_account'] == 2 and state['max_accounts'] == 15 and state['module_version'] == 2
     assert {a['slot'] for a in state['accounts']} == {1,2}
     assert {r['id'] for r in state['sources']} == {second}
     assert client.delete('/api/sources/'+first).status_code == 200
@@ -28,7 +28,7 @@ def test_account_header_scopes_state_sources_and_jobs(setup):
     assert {r['id'] for r in client.get('/api/state').json()['sources']} == {first}
 
 
-@pytest.mark.parametrize('slot',['0','6','-1','hello','2; DROP TABLE account'])
+@pytest.mark.parametrize('slot',['0','16','-1','hello','2; DROP TABLE account'])
 def test_account_selection_is_bounded(setup,slot):
     client,*_ = setup
     login(client)
